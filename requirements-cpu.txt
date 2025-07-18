@@ -1,12 +1,14 @@
-zarr
-fsspec[gcs]
-jax[cpu]==0.4.26
-einops
-hydra-core
-clearml
-clearml-agent
-typeguard==4.1.5
-ruff==0.11.12
-transformers  # For Huggingface data loader
-datasets      # For Huggingface data loader
-torch[cpu]    # For Huggingface data loader
+# conda create -n jax060 python==3.12
+einops==0.8.1
+fsspec[gcs]==2025.3.2
+gcsfs==2025.3.2
+google-cloud-firestore==2.20.1
+hydra-core==1.3.2
+jax[cpu]==0.6.0  # or jax[cuda12]==0.6.0
+numpy==2.2.4
+pre-commit==4.2.0
+ruff==0.11.3
+sentencepiece==0.2.0
+transformers==4.50.3
+typeguard==4.4.2
+zarr==3.0.6

@@ -33,4 +33,3 @@ jobs:
 
     # Format
     - run: ruff format --check
-

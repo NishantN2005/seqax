@@ -1,42 +1,64 @@
 # Command to run on your CPU:
-#   XLA_FLAGS=--xla_force_host_platform_device_count=8 python -m train --config-name=local_test_synthetic +paths.model_name=synthetic_000
+# XLA_FLAGS=--xla_force_host_platform_device_count=8 python -m train --config-name=local_test_synthetic +model_name=synthetic_000
 
-defaults:
-- base
-- _self_
-
-training:
-  warmup_steps: 10
-  steps:        50
-  steps_for_lr: 100
-  tokens:
-    batch: 64
-    len: 64
+root_working_dir: '/tmp'
+clone_from: ''
+clone_checkpoint_index: 0
+reset_optimizer: False
+log_tensor_stats: True
 
 model:
+  vocab: 1024
+  seq_len: 64
+  layers: 2
   d_model: 256
   n_q_per_kv: 2
   n_kv: 2
   d_head: 32
-  layers: 2
-  vocab: 1280
   d_ff: 1024
   rope_max_timescale: 256
+  nsa_l: 4  # compression block size
+  nsa_d: 2  # sliding stride
+  nsa_L: 8  # selected block size
+  nsa_n: 4  # selected block count (including first block and last two blocks)
+  nsa_w: 16  # window size
 
-paths:
-  root_working_dir: '/tmp'
+optimizer:
+  batch_size: 64
+  learning_rate: 3.0e-5
+  steps:        50
+  warmup_steps: 10
+  steps_for_lr: 100
+  cosine_learning_rate_final_fraction: 0.1
+  adam_b1: 0.9
+  adam_b2: 0.95
+  adam_eps: 1.e-8
+  adam_eps_root: 0.
+  weight_decay: 0.1
+  adam_completed_steps_offset: 0
+  dataloader_steps_offset: 0
 
-checkpoint_interval: 10
-num_hosts: 1
-
-mesh:
-  d: 4
-  t: 2
-
-flat_tokens:
+dataset:
   filespec: 'synthetic_dataset.zarr'
   streams: 2
   read_blocks_per_shuffle_buffer: 8
   sequences_per_read_block: 16
+  dataset_seqlen: 256
   seed: 0
-  sequence_packing: true
+  sequence_packing: True
+  eval_tokens: 196608
+
+weight_init_seed: 0
+einsum_seed: 0
+
+mesh:
+  d: 8
+  t: 1
+  s: 1
+use_firestore: False
+firestore_gcp_project: ''
+zarr_log_flush_frequency: 10
+checkpoint_interval: 10
+io:
+  max_io_threads: 64
+max_retries: 0

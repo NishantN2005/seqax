@@ -21,8 +21,6 @@ import flat_tokens
 import hydra
 import numpy as np
 from hydra.core.config_store import ConfigStore
-from jaxtyping import UInt32, jaxtyped
-from typeguard import typechecked as typechecker
 
 
 @dataclass
@@ -35,22 +33,17 @@ class Config:
     _target_: str = __name__ + ".Config"
 
 
-@jaxtyped(typechecker=typechecker)
-def copy(seq_len: int, examples: int, gen: np.random.Generator) -> UInt32[np.ndarray, b"batch seqlen"]:
+def copy(seq_len: int, examples: int, gen: np.random.Generator):
     seq = gen.integers(1, 11, (examples, (seq_len + 1) // 2), dtype=np.uint32)
     return np.append(seq, seq, axis=1)[:, :seq_len]
 
 
-@jaxtyped(typechecker=typechecker)
-def reverse(seq_len: int, examples: int, gen: np.random.Generator) -> UInt32[np.ndarray, b"batch seqlen"]:
+def reverse(seq_len: int, examples: int, gen: np.random.Generator):
     seq = gen.integers(1, 11, (examples, (seq_len + 1) // 2), dtype=np.uint32)
     return np.append(seq, np.flip(seq, axis=1), axis=1)[:, :seq_len]
 
 
-@jaxtyped(typechecker=typechecker)
-def random_known_distance_copy(
-    seq_len: int, examples: int, gen: np.random.Generator
-) -> UInt32[np.ndarray, b"batch seqlen"]:
+def random_known_distance_copy(seq_len: int, examples: int, gen: np.random.Generator):
     distance = gen.integers(max(1, seq_len // 4), seq_len, (examples,), dtype=np.uint32)
     seq = gen.integers(1, 11, (examples, seq_len), dtype=np.uint32)
     indices = np.arange(seq_len - 1)[np.newaxis, :] % distance[:, np.newaxis]
@@ -59,15 +52,11 @@ def random_known_distance_copy(
     return np.append(distance[:, np.newaxis], full_seq, axis=1)
 
 
-@jaxtyped(typechecker=typechecker)
-def random_unknown_distance_copy(
-    seq_len: int, examples: int, gen: np.random.Generator
-) -> UInt32[np.ndarray, b"batch seqlen"]:
+def random_unknown_distance_copy(seq_len: int, examples: int, gen: np.random.Generator):
     return random_known_distance_copy(seq_len + 1, examples, gen)[:, 1:]
 
 
-@jaxtyped(typechecker=typechecker)
-def mixture_of_gaussians(seq_len: int, examples: int, gen: np.random.Generator) -> UInt32[np.ndarray, b"batch seqlen"]:
+def mixture_of_gaussians(seq_len: int, examples: int, gen: np.random.Generator):
     centers = gen.uniform(0, 100, (examples, 3)).astype(np.float32)
     stddevs = gen.uniform(1, 4, (examples, 3)).astype(np.float32)
     sample_cluster_ids = gen.integers(0, 3, (examples, seq_len), dtype=np.uint32)
@@ -78,8 +67,7 @@ def mixture_of_gaussians(seq_len: int, examples: int, gen: np.random.Generator) 
     return np.clip(np.round(floats).astype(np.uint32), 1, 100)
 
 
-@jaxtyped(typechecker=typechecker)
-def synthetic_task(config: Config, gen: np.random.Generator) -> list[UInt32[np.ndarray, "..."]]:
+def synthetic_task(config: Config, gen: np.random.Generator):
     task_seq_len = config.seq_len - 1
     examples = config.examples
     copy_data = copy(task_seq_len, examples, gen)

@@ -4,9 +4,7 @@
 
 # seqax = sequence modeling + JAX
 
-seqax is a codebase for small-to-medium-scale LLM pretraining research. The entire training program---including the model implementation; optimizer; multihost FSDP and tensor parallel partitioning---is [500 lines of code](/train.py), which scales well up to ~100 GPUs or TPUs[^1] and [typically achieves good MFUs of 30-50%](#performance).
-
-[^1]: Achieving good performance at larger scale requires pipeline parallelism (which we have not yet implemented). At that scale, you may also care more about using custom kernels to further improve performance at the cost of code simplicity.
+seqax is a codebase for small-to-medium-scale LLM pretraining research.
 
 seqax is written in a style that makes the important information visible, rather than being hidden behind abstractions and indirections or being inferred automatically and unpredictably. This shows up in:
 
@@ -23,11 +21,11 @@ seqax is written in a style that makes the important information visible, rather
 1. Install `graphviz` from your system package manager: e.g. `brew install graphviz` or `apt install graphviz`.
 2. Install Python dependencies, typically inside a virtualenv: `python -m pip install -r requirements-cpu.txt`.
 
-   NOTE: the `requirements-cpu.txt` is configured for CPU-based installation. For GPU or TPU installation, you may need a different install of JAX and jaxlib. Consult the [JAX install documentation](https://jax.readthedocs.io/en/latest/installation.html). If your GPU environment has a Torch-GPU installation, you may need to switch it to a Torch-CPU installation to avoid conflicts with JAX-GPU.
+   NOTE: the `requirements-cpu.txt` is configured for CPU-based installation. For GPU or TPU installation, you may need a different install of JAX and jaxlib. If replacing `jax[cpu]==0.6.0` with `jax[cuda12]==0.6.0` in `requirements-cpu.txt` doesn't work, consult the [JAX install documentation](https://jax.readthedocs.io/en/latest/installation.html). If your GPU environment has a Torch-GPU installation, you may need to switch it to a Torch-CPU installation to avoid conflicts with JAX-GPU.
 
 ### Run on CPU for local development
 
-For development and testing you can run on CPU. Typically you'd use our synthetic dataset (which is [checked into this repository](/synthetic_dataset.zarr)) or the [Huggingface data loader](#data-loaders) and you'd set XLA flags to simulate multiple devices so as to test that parallelism is working as intended:
+For development and testing you can run on CPU. Typically you'd use our synthetic dataset (which is [checked into this repository](/synthetic_dataset.zarr)) and you'd set XLA flags to simulate multiple devices so as to test that parallelism is working as intended:
 
 ```
 XLA_FLAGS=--xla_force_host_platform_device_count=8 python -m train --config-name=local_test_synthetic +paths.model_name=synthetic_000
@@ -37,34 +35,15 @@ The `paths.model_name` flag specifies which subdirectory on disk (inside `/tmp`)
 
 ### Run on GPUs
 
-We have configured a range of model sizes, to be trained on the C4 dataset with the Llama tokenizer. Browse the `configs/` directory to select your preferred configuration file. Each configuration file lists how to run it at the top.
+We have configured two model sizes to be trained on the [LongCrawl64](https://manifestai.com/articles/longcrawl64/) dataset. Browse the `configs/` directory to select your preferred configuration file. Each configuration file lists how to run it at the top.
 
 You typically want to set `paths.model_name` to a unique name for each distinct training run. This path specifies which subdirectory on disk to write model checkpoints to.
 
-## Performance
-
-Recent benchmark results on A100 clusters:
-
-Single-host A100x8
-| Model Size | MFU   |
-|------------|-------|
-| 84m        | 14    |
-| 270m       | 24    |
-| 540m       | 35    |
-| 1b         | 41.6  |
-| 2b         | 50.66 |
-
-On 4 A100x8 hosts connected with infiniband
-| Model Size | MFU   |
-|------------|-------|
-| 1b         | 32.4  |
-| 2b         | 39.0  |
-
 ## Data loaders
 
-seqax can stream training data directly from Huggingface (see [example config](/configs/huggingface_c4_a100x1_84m.yaml)), or can first convert the training data to a pre-tokenized format on disk which we call [flat-tokens](/docs/flat-tokens.md) (see [example config](/configs/flat_tokens_c4_a100x1_84m.yaml)). Streaming from Huggingface allows you to quickly experiment with different datasets, but it doesn't offer an efficient way to resume training from a checkpoint after a job is aborted, and it wastes some tokens from the dataset at batch boundaries. The flat-tokens format supports efficiently resuming training from a checkpoint, uses 100% of tokens for training, and also consumes less CPU time during training.
+seqax first converts the training data to a pre-tokenized format on disk which we call [flat-tokens](/docs/flat-tokens.md) (see [example config](/configs/flat_tokens_c4_a100x1_84m.yaml)). The flat-tokens format supports efficiently resuming training from a checkpoint, uses 100% of tokens for training, and also consumes less CPU time during training.
 
-To pre-tokenize the training data, you can run [huggingface_to_flat_tokens.py](/tools/huggingface_to_flat_tokens.py). You'll need to first install the requirements in [/tools/requirements.txt](/tools/requirements.txt), and then you can invoke the command listed at the top of [/tools/configs/c4_en.yaml](/tools/configs/c4_en.yaml). On modern CPUs this script processes about 100M tokens per minute. You can limit the number of output tokens it processes with a configuration flag.
+To pre-tokenize the training data, you can run [longcrawl64_to_flat_tokens.py](/tools/longcrawl64_to_flat_tokens.py) after following instructions at the top of that file to download the [LongCrawl64](https://manifestai.com/articles/longcrawl64/) dataset. You'll need to first install the requirements in [/tools/requirements.txt](/tools/requirements.txt).
 
 ## Expressing partitioning and communication with `shardlib`
 

@@ -1,0 +1,8 @@
+filespec: '/your/path/to/longcrawl64/longcrawl64-flat-tokens.zarr/'
+streams: 1
+read_blocks_per_shuffle_buffer: 1024
+sequences_per_read_block: 1024
+seed: 1
+dataset_seqlen: 1024
+sequence_packing: True
+eval_tokens: 50331648

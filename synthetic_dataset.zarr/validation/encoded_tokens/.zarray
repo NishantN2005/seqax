@@ -9,6 +9,7 @@
         "id": "blosc",
         "shuffle": 2
     },
+    "dimension_separator": ".",
     "dtype": "<u4",
     "fill_value": null,
     "filters": null,

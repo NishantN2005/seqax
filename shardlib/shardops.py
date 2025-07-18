@@ -1,3 +1,6 @@
+import inspect
+import re
+
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -5,6 +8,42 @@ from jax import lax
 import shardlib.shardtypes as shardtypes
 
 
+def named_scope(func):
+    """
+    Wraps a function into a jax.named_scope context manager that includes the caller's source code to display in the HLO SVG.
+    """
+
+    def wrapper(*args, **kwargs):
+        current_frame = inspect.currentframe()
+        caller_frame = current_frame.f_back
+        caller_info = inspect.getframeinfo(caller_frame)
+        file_name = caller_info.filename
+        line_number = caller_info.lineno - 1
+        with open(file_name, "r") as f:
+            lines = f.readlines()
+        for start_line in range(line_number, -1, -1):
+            if "=" in lines[start_line]:
+                break
+        else:
+            start_line = line_number
+        for end_line in range(line_number, len(lines)):
+            if ")" in lines[end_line]:
+                break
+        else:
+            end_line = line_number
+        caller_code = lines[start_line : end_line + 1]
+        caller_code = " ".join(caller_code)
+        caller_code = caller_code.replace("\n", " ")
+        caller_code = caller_code.strip()
+        caller_code = re.sub(r"  +", " ", caller_code)
+        scope_name = f"seqax_<{caller_code}>_xaqes"
+        with jax.named_scope(scope_name):
+            return func(*args, **kwargs)
+
+    return wrapper
+
+
+@named_scope
 def all_gather(spec: str, x):
     """String-specified all-gather operation.
 
@@ -27,6 +66,7 @@ def all_gather(spec: str, x):
     return x
 
 
+@named_scope
 def psum_scatter(spec: str, x):
     """String-specified reduce-scatter operation.
 
@@ -49,6 +89,7 @@ def psum_scatter(spec: str, x):
     return x
 
 
+@named_scope
 def einsum_unreduced(spec: str, x, y, **kwargs):
     """Ordinary chip-local einsum, but with sharding-aware typechecking.
 
@@ -99,11 +140,39 @@ def einsum_unreduced(spec: str, x, y, **kwargs):
     return r
 
 
-def index_unreduced(spec: str, table, indices):
+@named_scope
+def pmean_across_replicas(pspec: jax.sharding.PartitionSpec, x):
+    """Computes pmean across all replicated (non-sharded) dimensions of the tensor"""
+    sharded_axes = set()
+    for axis in pspec:
+        if axis is None:
+            continue
+        elif isinstance(axis, str):
+            sharded_axes.add(axis)
+        elif isinstance(axis, tuple):
+            for a in axis:
+                if isinstance(a, str):
+                    sharded_axes.add(a)
+        else:
+            raise ValueError(f"Unknown axis type {axis}")
+
+    pmean_axes = []
+    for axis in jax._src.core.get_axis_env().axis_sizes:
+        if axis not in sharded_axes:
+            pmean_axes.append(axis)
+
+    if pmean_axes:
+        return jax.lax.pmean(x, tuple(pmean_axes))
+    else:
+        return x
+
+
+@named_scope
+def index_unreduced(spec: str, table, indices, use_onehot=False):
     """String-specified sharded table lookup operation.
 
     For example:
-      index_unreduced(table, indices, 'A [B/x/y] C/z, D/w A -> C/z A D/w')
+      index_unreduced('A [B/x/y] C/z, D/w A -> C/z A D/w', table, indices)
 
     In this example, the integers in `indices` are used as lookup addresses into the
     `B` dimension of `table`, and all other dimensions (`A`, `C`, `D`) are vmapped over.
@@ -115,34 +184,46 @@ def index_unreduced(spec: str, table, indices):
     index is out of bounds, will return zero. The caller is required to reduce the output
     over the axes specified by the square brackets: in the above example, the caller must
     reduce over `x` and `y` axes.
+
+    use_onehot: If True, onehot multiply is performed instead of embeddings lookups. This is faster on TPU.
     """
     tmp, result = spec.split("->")
     lhs, rhs = tmp.split(",")
-    lhs_dims = lhs.split()
+    lhs_split = lhs.split()
     index_axis = None
-    for i, dim in enumerate(lhs_dims):
+    for i, dim in enumerate(lhs_split):
         if dim.startswith("["):
             index_axis = i
             if not dim.endswith("]"):
                 raise ValueError(f"Expected closing bracket in {dim}")
-            lhs_dims[i] = dim[1:-1]
+            lhs_split[i] = dim[1:-1]
             break
     if index_axis is None:
         raise ValueError(f"Expected an index axis in {lhs}")
 
-    lhs_dims = [shardtypes.DimSpec.parse(dim) for dim in lhs_dims]
+    lhs_dims = [shardtypes.DimSpec.parse(dim) for dim in lhs_split]
     lhs_spec = shardtypes.ShapeSpec(lhs_dims)
     rhs_spec = shardtypes.ShapeSpec.parse(rhs)
     result_spec = shardtypes.ShapeSpec.parse(result)
     shardtypes.check(table.dtype, lhs_spec, table)
     shardtypes.check(indices.dtype, rhs_spec, indices)
 
+    len_per_chip = table.shape[index_axis]
+    lower_bound = len_per_chip * lax.axis_index(lhs_dims[index_axis].sharding)
+    upper_bound = lower_bound + len_per_chip
+
+    if use_onehot:
+        onehot_lhs = rhs + lhs_split[index_axis]
+        onehot_rhs = " ".join(lhs_split)
+        return einsum_unreduced(
+            f"{onehot_lhs}, {onehot_rhs} -> {result}",
+            jax.nn.one_hot(indices - lower_bound, len_per_chip, dtype=table.dtype),
+            table,
+        )
+
     # Do the base operation on scalars, then do a sequence of vmap operations to bring it up
     # to the desired shape.
     def base_op(table, index):
-        len_per_chip = table.shape[0]
-        lower_bound = len_per_chip * lax.axis_index(lhs_dims[index_axis].sharding)
-        upper_bound = lower_bound + len_per_chip
         in_bounds = (lower_bound <= index) & (index < upper_bound)
         return jnp.where(in_bounds, table[jnp.where(in_bounds, index - lower_bound, 0)], 0)
 
@@ -180,6 +261,78 @@ def index_unreduced(spec: str, table, indices):
     return result
 
 
+@named_scope
 def axis_size(name: str) -> int:
     """Return the size of the axis with the given name."""
     return jax.lax.psum(1, name)
+
+
+@named_scope
+def sharded_arange(n: int, mesh_axis: str) -> jnp.array:
+    assert n % axis_size(mesh_axis) == 0, f"n={n} is not divisible by {mesh_axis} size {axis_size(mesh_axis)}"
+    shard_size = n // axis_size(mesh_axis)
+    return jax.lax.axis_index(mesh_axis) * shard_size + jnp.arange(shard_size)
+
+
+@named_scope
+def shard(x: jnp.array, spec: str) -> jnp.array:
+    """
+    Shard tensor's axis along a given given mesh axis.
+
+    Note, this function requires the input tensor to be replicated, so it can be worth
+    considering if you can create the shards independently on each device.
+    """
+    before, after = spec.split("->")
+    before = shardtypes.ShapeSpec.parse(before)
+    after = shardtypes.ShapeSpec.parse(after)
+
+    sharded = set()
+    starts = []
+    lens = []
+    for i, (before_dim, after_dim) in enumerate(zip(before.dims, after.dims)):
+        if sharded.intersection(after_dim.sharding):
+            raise ValueError(f"Cannot shard {before_dim} into {after_dim}. Mesh axis is already sharded")
+        sharded.update(after_dim.sharding)
+        if before_dim.shape != after_dim.shape:
+            raise ValueError(
+                f"Cannot shard {before_dim} into {after_dim}. The ordering of dimensions should not change."
+            )
+
+        if len(before_dim.sharding) + 1 < len(after_dim.sharding):
+            raise ValueError(
+                f"Cannot shard {before_dim} into {after_dim}. We can only shard along one mesh axis per dimension"
+            )
+
+        if before_dim.sharding != after_dim.sharding[: len(before_dim.sharding)]:
+            raise ValueError(f"Cannot shard {before_dim} into {after_dim}. New sharding can only be added")
+
+        if before_dim.sharding == after_dim.sharding:
+            starts.append(0)
+            lens.append(x.shape[i])
+        else:
+            new_sharding = after_dim.sharding[-1]
+            shard_size = x.shape[i] // axis_size(new_sharding)
+            starts.append(jax.lax.axis_index(new_sharding) * shard_size)
+            lens.append(shard_size)
+    return jax.lax.dynamic_slice(x, starts, lens)
+
+
+@named_scope
+def ring_permute_sharded(x, axis_index: int, mesh_axis: str):
+    """Ring permute `x` by one index in the `axis_index` dimension which is sharded along `mesh_axis`.
+
+    The elements crossing from last to first are zeroed out, for example:
+    {dev0:[1, 2, 3], dev1: [4, 5, 6]} -> {dev0:[0, 1, 2], dev1: [3, 4, 5]}.
+    """
+    sl = [slice(None)] * x.ndim
+    sl[axis_index] = slice(-1, None)
+    x_last = x[tuple(sl)]
+    n_s = axis_size(mesh_axis)
+    permutation = [(i, (i + 1) % n_s) for i in range(n_s)]
+    x_last = lax.ppermute(x_last, axis_name=mesh_axis, perm=permutation)
+    # Zero out the elements passed from last to first
+    x_last = jnp.where(lax.axis_index(mesh_axis) == 0, jnp.zeros_like(x_last), x_last)
+    sl[axis_index] = slice(None, -1)
+    x_shifted = x[tuple(sl)]
+    x = jnp.concatenate([x_last, x_shifted], axis=axis_index)
+    return x

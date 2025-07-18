@@ -1,6 +1,7 @@
 import concurrent
 import enum
 from dataclasses import dataclass
+from typing import List, Union
 
 import numpy as np
 import zarr
@@ -28,9 +29,9 @@ class Chunk:
     max_token_id: int
 
     @staticmethod
-    def from_ragged(sequences: list[np.ndarray]):
+    def from_ragged(sequences: List[Union[list, np.ndarray]]):
         """Converts a list of sequences to a FlatTokensChunk."""
-        tokens = np.concatenate(sequences)
+        tokens = np.concatenate(sequences, dtype=np.uint32, casting="unsafe")
         seq_starts = np.zeros(len(sequences) + 1, np.uint64)
         np.cumsum([len(seq) for seq in sequences], out=seq_starts[1:])
         # Some number of the seq_starts will equal len(tokens). Typically it's just one of them,
@@ -91,5 +92,8 @@ class Writer:
             self.group.attrs["max_token_id"] = chunk.max_token_id
         # In parallel:
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            executor.submit(lambda: self.encoded_tokens.append(chunk.encoded_tokens))
-            executor.submit(lambda: self.seq_starts.append(num_tokens + chunk.seq_starts[1:]))
+            futures = []
+            futures.append(executor.submit(lambda: self.encoded_tokens.append(chunk.encoded_tokens)))
+            futures.append(executor.submit(lambda: self.seq_starts.append(num_tokens + chunk.seq_starts[1:])))
+        for future in futures:
+            future.result()

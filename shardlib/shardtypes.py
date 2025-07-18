@@ -52,7 +52,9 @@ from types import GenericAlias
 from typing import Union, get_args, get_origin
 
 import jax
+import jax.experimental.shard_map
 import jax.numpy as jnp
+import numpy as np
 from typeguard import TypeCheckerCallable, TypeCheckError, check_type_internal, checker_lookup_functions, typechecked
 
 #### State
@@ -113,6 +115,21 @@ class DimSpec:
     def __str__(self):
         return "/".join([self.shape] + list(self.sharding))
 
+    def get_per_shard_shape_from_environment(self) -> int:
+        """Looks up the per-shard size of the dimension in the current environment."""
+        # Look up global shape
+        v = _VARS.get()
+        if self.shape not in v:
+            raise TypeCheckError(f"unknown dimension {self.shape}")
+        global_shape = v[self.shape]
+        # Look up sharding
+        axis_sizes = jax._src.core.get_axis_env().axis_sizes
+        for axis in self.sharding:
+            if axis not in axis_sizes:
+                raise TypeCheckError(f"unknown axis {axis}")
+            global_shape //= axis_sizes[axis]
+        return global_shape
+
 
 @dataclass
 class ShapeSpec:
@@ -147,6 +164,9 @@ class ShapeSpec:
     def __str__(self):
         return " ".join(str(dim) for dim in self.dims)
 
+    def get_per_shard_shape_from_environment(self) -> Sequence[int]:
+        return [dim.get_per_shard_shape_from_environment() for dim in self.dims]
+
 
 #### Shape checking
 def _partition_spec_equiv(lhs: jax.sharding.PartitionSpec, rhs: jax.sharding.PartitionSpec) -> bool:
@@ -159,33 +179,36 @@ def _partition_spec_equiv(lhs: jax.sharding.PartitionSpec, rhs: jax.sharding.Par
 
 def check(dtype, shape_spec: ShapeSpec, value):
     """Checks that a value has the expected dtype and shape."""
-    if not isinstance(value, jax.Array):
-        raise TypeCheckError("is not a jax.Array")
+    if not isinstance(value, (jax.Array, jax.ShapeDtypeStruct, np.ndarray)):
+        raise TypeCheckError("is not a jax.Array or numpy.ndarray")
+    if isinstance(value, np.ndarray) and any((dim_spec.sharding for dim_spec in shape_spec.dims)):
+        raise TypeCheckError("is a numpy.ndarray, but has sharding information in the type annotation")
     if value.dtype != dtype:
         raise TypeCheckError(f"is {value.dtype}, but expected {dtype}")
     shape = value.shape
     if len(shape) != len(shape_spec.dims):
         raise TypeCheckError(f"has shape {shape}, but expected shape {str(shape_spec)}")
-    mesh = None
 
-    axis_env = jax._src.core.thread_local_state.trace_state.axis_env
-    if axis_env:
+    axis_sizes = jax._src.core.get_axis_env().axis_sizes
+    if axis_sizes and not isinstance(value, np.ndarray):
         # We're in a shard_map/pmap/xmap context. Multiply sizes by sharding, then check sizes.
         # We don't actually check the sharding, because that information is lost inside a
         # shard_map/pmap/xmap context, but we do check the unsharded sizes are correct.
-        mesh = {axis.name: axis.size for axis in axis_env}
         for orig_dim, dim_spec in zip(shape, shape_spec.dims):
             dim = orig_dim
             for axis in dim_spec.sharding:
-                if axis not in mesh:
+                if axis not in axis_sizes:
                     raise TypeCheckError(f"has unknown mesh axis {axis}")
-                axis_size = mesh[axis]
+                axis_size = axis_sizes[axis]
                 dim *= axis_size
             check_size(dim_spec.shape, dim)
     else:
         # Check sizes
         for dim, dim_spec in zip(shape, shape_spec.dims):
             check_size(dim_spec.shape, dim)
+
+        if isinstance(value, np.ndarray):
+            return
 
         # Check sharding
         expected_spec = shape_spec.partition_spec()
@@ -197,7 +220,7 @@ def check(dtype, shape_spec: ShapeSpec, value):
             elif not isinstance(actual, jax.sharding.NamedSharding):
                 if isinstance(actual, jax.sharding.Sharding):
                     raise TypeCheckError(
-                        "is SPMD-sharded but no axis names are available. Use `with Mesh(...):` to provide axis names for type checking."
+                        "is SPMD-sharded but no axis names are available. Use `with Mesh(...):` and `@typed_shard_map` to provide axis names for type checking."
                     )
                 else:
                     raise TypeCheckError(f": unexpected object when checking sharding: {actual}")
@@ -210,7 +233,7 @@ def check(dtype, shape_spec: ShapeSpec, value):
                 pass
 
         # Use tracing as a proxy for whether we're in a jit context
-        is_tracing = jax._src.core.thread_local_state.trace_state.trace_stack
+        is_tracing = jax._src.core.unsafe_am_i_under_a_jit()
         if is_tracing:
             jax.debug.inspect_array_sharding(value, callback=cb)
         else:
@@ -322,9 +345,9 @@ class Array:
 
         if dataclasses.is_dataclass(input_cls):
             extended_fields = []
-            for fld in dataclasses.fields(input_cls):
-                extended_type = Array[axes, fld.type]
-                extended_fields.append((fld.name, extended_type))
+            for field in dataclasses.fields(input_cls):
+                extended_type = Array[axes, field.type]
+                extended_fields.append((field.name, extended_type))
 
             extended_cls = make_dataclass(input_cls.__name__, extended_fields, bases=(input_cls,))
             pytree_dataclass(extended_cls)
@@ -352,6 +375,15 @@ def make_partition_specs(cls):
         for field in dataclasses.fields(cls):
             values.append(make_partition_specs(field.type))
         return cls(*values)
+    elif origin is dict:
+        assert args[0] is str, f"make_partition_specs for dict type: Only allowing `str` keys, but got {args[0]}"
+        p_leaves, _ = jax.tree_util.tree_flatten(make_partition_specs(args[1]))
+        p_set = set(p_leaves)
+        fully_replicated = jax.sharding.PartitionSpec()
+        assert len(p_set) == 1 and p_set.pop() == fully_replicated, (
+            f"make_partition_specs for dict type: Only allowing fully replicated scalars as values, but got {args[1]}"
+        )
+        return fully_replicated
 
     raise ValueError(f"Unsupported type {cls} is not a array, dataclass, or tuple type")
 
@@ -359,7 +391,7 @@ def make_partition_specs(cls):
 def make_shardings(cls):
     """Instantiates a pytree dataclass with NamedSharding at array type."""
     mesh = jax._src.mesh.thread_resources.env.physical_mesh
-    return jax.tree_map(lambda spec: jax.sharding.NamedSharding(mesh, spec), make_partition_specs(cls))
+    return jax.tree_util.tree_map(lambda spec: jax.sharding.NamedSharding(mesh, spec), make_partition_specs(cls))
 
 
 def typed_shard_map(f, **kwargs):
@@ -398,4 +430,4 @@ def is_fully_sharded(spec: jax.sharding.PartitionSpec):
             axis_count += len(axis)
         else:
             raise ValueError(f"Unknown axis type {axis}")
-    return axis_count == len(jax._src.core.thread_local_state.trace_state.axis_env)
+    return axis_count == len(jax._src.core.get_axis_env().axis_sizes)

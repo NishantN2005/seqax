@@ -1,0 +1,36 @@
+# python -m train --config-name=longcrawl_1176m +model_name=1176m
+defaults:
+- base
+- dataset/longcrawl
+- _self_
+
+dataset:
+  dataset_seqlen: 2048
+  sequences_per_read_block: 512
+  read_blocks_per_shuffle_buffer: 4096
+
+model:
+  vocab: 50304
+  seq_len: 2048
+  layers: 16
+  d_model: 2048
+  n_q_per_kv: 8
+  n_kv: 2
+  d_head: 128
+  d_ff: 8864
+  rope_max_timescale: 10000
+  nsa_l: 32  # compression block size
+  nsa_d: 16  # sliding stride
+  nsa_L: 64  # selected block size
+  nsa_n: 4  # selected block count (including first block and last two blocks)
+  nsa_w: 128  # window size
+
+optimizer:
+  batch_size: 256
+  learning_rate: 3e-3
+  steps:        19070
+  warmup_steps: 1907
+  steps_for_lr: 19070
+  cosine_learning_rate_final_fraction: 0.01
+
+checkpoint_interval: 1907

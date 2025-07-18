@@ -1,5 +1,1 @@
-zarr
-fsspec[gcs]
-transformers
-datasets
-hydra-core
+zarr==2.18.7
