@@ -1,0 +1,110 @@
+# SPIRe reproduction configs — extracted from arXiv:2504.06419 and
+# github.com/MatX-inc/seqax @ SPIRe tag (spire_appendix.ipynb).
+# Every value below is sourced from the paper/notebook unless marked CHOICE
+# (our decision, paper doesn't specify) or DERIVED (computed from paper values).
+
+common:
+  vocab: 50304                  # LongCrawl64 / GPT-2 padded vocab (from NSA-tag longcrawl configs)
+  train_seq_len: 1024           # "using sequences of length 1024"
+  dataset: longcrawl64          # NOT C4 — loader exists in NSA tag
+  rope_max_timescale: 10000     # CHOICE: matches NSA-tag longcrawl configs; paper silent
+  dtype_bytes: 1                # cost model assumes "all values stored as a 1-byte data type" (FP8)
+
+# ── Models ────────────────────────────────────────────────────────────────────
+# get_N body-parameter formula (GQA-SwiGLU):
+#   layers * (2*d_model + (n_q_per_kv+2)*n_kv*d_model*d_head
+#             + n_q_per_kv*n_kv*d_head*d_model + 3*d_model*d_ff)
+
+target:                         # "seqax 67M", 8-layer MHA
+  layers: 8
+  d_model: 512
+  n_q_per_kv: 1                 # MHA: 8 query heads, 8 KV heads
+  n_kv: 8
+  d_head: 128
+  d_ff: 4096
+  body_params: 67_117_056       # DERIVED, matches notebook print
+  total_params: 118_628_352     # DERIVED: body + 2 * vocab * d_model
+  train_tokens: 2_372_567_040   # DERIVED: 20 x total_params (Hoffmann scaling)
+
+vanilla_sd_draft:               # 1/8th body params, standard CE loss
+  layers: 4
+  d_model: 256
+  n_q_per_kv: 1
+  n_kv: 8
+  d_head: 64
+  d_ff: 2048
+  body_params: 8_390_656        # DERIVED
+  total_params: 34_146_304      # DERIVED
+  train_tokens: 682_926_080     # DERIVED: 20 x total_params
+  loss: hard_target_ce
+
+spire_draft:                    # 1/4th body params; d_model matches target
+  layers: 2
+  d_model: 512
+  n_q_per_kv: 1
+  n_kv: 8
+  d_head: 128
+  d_ff: 4096
+  body_params: 16_779_264       # DERIVED
+  total_params: 68_290_560      # DERIVED
+  train_tokens: 1_365_811_200   # DERIVED: 20 x total_params
+  init:
+    scheme: prune_target        # embedding, target layers 7-8, unembedding
+    target_layers_used: [7, 8]  # draft layer i <- target layer i+6
+  attention:
+    mask: streaming_llm         # during BOTH training and inference
+    sink_size: 1
+    window: 64                  # = L/window_factor at L=512; notebook: window_factor=8
+    positions: original_text    # SPIRe uses text positions (MagicDec uses cache positions)
+  feedback_memory:
+    enabled: true
+    per_layer_weights: true     # (w_il) in R^{n_layer x (n_layer+1)}; NOT shared across layers
+    substitute_past_memory_with: target_activations   # m_t^i = y_t^{i+6-1} for t <= S-k
+    train_rollout_k: 4          # k forward passes per k-th prefix (teacher-forced AR)
+  loss:
+    type: mixed                 # MixedLoss(w) = w*distill_CE + (1-w)*(-alpha)
+    omega: 0.5                  # w=0.5 marginally beat w=1
+    alpha_term: expected_acceptance_probability   # Leviathan et al. alpha
+
+magicdec_baseline:              # no training needed — target weights reused
+  weights: target
+  attention:
+    mask: streaming_llm
+    sink_size: 1
+    window: 64                  # window_factor=8
+    positions: within_cache     # per paper footnote 4
+
+# ── Speculative decoding evaluation (tau measurement) ────────────────────────
+sd_eval:
+  k: 4                          # maximum speculation depth
+  generate_tokens: 64           # G=64 per context
+  num_contexts: 65536           # n=65536, LongCrawl64 validation split
+  context_lengths: [256, 512, 960]
+  verification: token_level     # Leviathan-style rejection sampling (not block)
+  reference_taus:               # Table 1, L=512 (the ones used in all figures)
+    vanilla_sd: 2.647           # +/- 0.004
+    magicdec: 3.891
+    spire: 3.401
+  ablation_taus:                # Figure 5 (L=512)
+    spire_random_init: 3.105
+    spire_distill_only: 3.375
+    spire_hard_target_loss: 3.069
+    spire_no_feedback_memory: 3.352
+    spire_no_fm_no_target_acts: 2.959
+
+# ── Performance model (what your measurements test) ──────────────────────────
+perf_model:
+  HOI: 600                      # H100 SXM: FP8 dense tensor FLOPs / HBM bandwidth
+  hardware: nvidia_h100_sxm_fp8 # measure here for the faithful comparison
+  f: max                        # roofline; overlap of compute & memory assumed
+  window_factor: 8              # draft window = L/8 (not fixed 64) in itm sweeps
+  figure_grid:
+    B_values: [1, 2, 4, 8, 16, 32, 64, 128]
+    L_values: [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+    highlighted: {B: 64, L: 512}
+
+# ── Not specified in paper/notebook (decide and document) ────────────────────
+open_choices:
+  train_batch_size: null        # paper silent; pick for hardware, log it
+  lr_schedule: null             # seqax default is cosine w/ warmup; paper silent
+  sampling_temperature: null    # for tau measurement; paper silent (assume 1.0)

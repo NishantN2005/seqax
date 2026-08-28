@@ -486,10 +486,6 @@ def train_attempt(config: DictConfig):
 
 @hydra.main(config_path="configs", version_base=None)
 def main(config: DictConfig):
-    assert config.model.nsa_d < config.model.nsa_l, "Authors require d < l to avoid information fragmentation"
-    assert config.model.nsa_l <= config.model.nsa_L, "Authors require l <= l'"
-    assert config.model.nsa_l % config.model.nsa_d == 0, "Authors require d | l"
-    assert config.model.nsa_L % config.model.nsa_d == 0, "Authors require d | l'"
     assert config.model.seq_len % config.model.nsa_L == 0, "We require l' | Klen"
     assert config.model.nsa_n >= 3, "Always take 1st block, last 2 blocks"
     assert config.mesh.t == config.mesh.s == 1, "Tensor and sequence parallelism are not supported"

@@ -17,11 +17,6 @@ model:
   d_head: 32
   d_ff: 1024
   rope_max_timescale: 256
-  nsa_l: 4  # compression block size
-  nsa_d: 2  # sliding stride
-  nsa_L: 8  # selected block size
-  nsa_n: 4  # selected block count (including first block and last two blocks)
-  nsa_w: 16  # window size
 
 optimizer:
   batch_size: 64
