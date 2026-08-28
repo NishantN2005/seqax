@@ -16,6 +16,19 @@ Assumptions, stated rather than handled:
   This matches the SPIRe evaluation protocol: fixed-length contexts from
   LongCrawl64, generate G tokens each.
 - No EOS handling: exactly G tokens are generated per sequence.
+- Attention pattern: dense causal by default, or a StreamingLLM sink +
+  sliding-window mask (sink_size, window) as used by the MagicDec baseline and
+  the SPIRe draft. `window` counts the most recent tokens INCLUDING the
+  current one; visibility for query position q is:
+      k <= q  AND  (k < sink_size  OR  k > q - window).
+  RoPE uses ORIGINAL TEXT positions (the SPIRe convention, paper footnote 4).
+  The MagicDec convention (positions within the cache) is NOT implemented
+  here; it needs per-key rope positions and belongs with the MagicDec draft
+  in the speculative decoding loop.
+  Note the mask reduces which cache entries are ATTENDED, not which are
+  READ: memory traffic is unchanged. The compact ring-buffer cache that
+  realizes the bandwidth savings is a later, measurement-phase change; for
+  acceptance-rate (tau) measurement the mask is sufficient.
 - temperature == 0.0 means greedy; otherwise softmax sampling at that
   temperature, with per-device RNG decorrelation across the "d" axis.
 
@@ -48,6 +61,17 @@ shardtypes.register_with_typeguard()
 PRNGKey = u32[b"2"]
 
 
+def streaming_visibility(q_pos: jax.Array, k_pos: jax.Array, sink_size: int, window: int) -> jax.Array:
+    """StreamingLLM visibility: causal AND (sink OR within sliding window).
+
+    q_pos, k_pos are absolute positions (broadcastable). `window` includes the
+    current token: window=1 means each token sees only itself (plus sinks).
+    """
+    causal = k_pos <= q_pos
+    visible = jnp.logical_or(k_pos < sink_size, k_pos > q_pos - window)
+    return jnp.logical_and(causal, visible)
+
+
 def _sample(logits: jax.Array, rng: jax.Array, step: jax.Array, temperature: float) -> jax.Array:
     """Sample next token ids [B] from logits [B, V]. temperature == 0.0 -> greedy."""
     if temperature == 0.0:
@@ -57,13 +81,18 @@ def _sample(logits: jax.Array, rng: jax.Array, step: jax.Array, temperature: flo
     return jax.random.categorical(key, logits / temperature, axis=-1).astype(jnp.uint32)
 
 
-def make_generate(h: ModelConfig, prompt_len: int, gen_len: int, temperature: float):
+def make_generate(h: ModelConfig, prompt_len: int, gen_len: int, temperature: float,
+                  sink_size: int = 0, window: int | None = None):
     """Build a jitted, sharded generate function for fixed prompt/generation lengths.
 
     Returns generate(weights, prompt_ids[B, prompt_len], rng) -> generated_ids[B, gen_len].
-    Recompiles for each distinct (prompt_len, gen_len, temperature, model config).
+    window=None gives dense causal attention; otherwise a StreamingLLM
+    sink + sliding-window mask (see module docstring).
+    Recompiles for each distinct argument combination.
     """
     P, G = prompt_len, gen_len
+    if window is None:
+        window = P + G  # window covers everything reachable -> exactly dense
     Klen = P + G  # fixed cache size; the last generated token is never written back
 
     @jax.jit
@@ -76,7 +105,7 @@ def make_generate(h: ModelConfig, prompt_len: int, gen_len: int, temperature: fl
         # ---- Prefill: fill cache positions [0, P), sample token P ----
         cache = jnp.zeros((h.layers, 2, lb, Klen, h.n_kv, h.d_head), dtype=jnp.bfloat16)
         q_pos = jnp.arange(P)[jnp.newaxis, :, jnp.newaxis]  # absolute positions 0..P-1
-        prefill_mask = jnp.broadcast_to(k_pos <= q_pos, (lb, P, Klen))
+        prefill_mask = jnp.broadcast_to(streaming_visibility(q_pos, k_pos, sink_size, window), (lb, P, Klen))
         with shardtypes.Scope():
             logits, cache, _ = w.forward_pass(h, prompt, prefill_mask, kv_cache=cache, kv_offset=jnp.int32(0))
         tok = _sample(logits[:, -1], rng, jnp.uint32(0), temperature)  # [lb]
@@ -85,7 +114,7 @@ def make_generate(h: ModelConfig, prompt_len: int, gen_len: int, temperature: fl
         # cache and used to sample the token at position pos + 1. ----
         def step(carry, step_idx):
             cache, tok, pos = carry
-            mask = jnp.broadcast_to(k_pos <= pos, (lb, 1, Klen))
+            mask = jnp.broadcast_to(streaming_visibility(pos, k_pos, sink_size, window), (lb, 1, Klen))
             with shardtypes.Scope():
                 logits, cache, _ = w.forward_pass(
                     h, tok[:, jnp.newaxis], mask, kv_cache=cache, kv_offset=pos
@@ -103,20 +132,24 @@ def make_generate(h: ModelConfig, prompt_len: int, gen_len: int, temperature: fl
     return generate
 
 
-def make_greedy_check(h: ModelConfig, prompt_len: int, gen_len: int):
+def make_greedy_check(h: ModelConfig, prompt_len: int, gen_len: int,
+                      sink_size: int = 0, window: int | None = None):
     """Reference check: teacher-force [prompt || generated] through the full
     non-cached forward pass; greedy generation is correct iff generated[t] equals
     argmax of the full-pass logits at the preceding position, for every t."""
     P, G = prompt_len, gen_len
     T = P + G
+    if window is None:
+        window = T
 
     @jax.jit
     @partial(shardtypes.typed_shard_map, check_rep=False)
     @typechecked
     def check(w: Model, full_ids: u32[b"B/d T"]) -> f32[b""]:
         lb = full_ids.shape[0]
-        causal = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))[jnp.newaxis, ...]
-        mask = jnp.broadcast_to(causal, (lb, T, T))
+        q_pos = jnp.arange(T)[:, jnp.newaxis]
+        k_pos = jnp.arange(T)[jnp.newaxis, :]
+        mask = jnp.broadcast_to(streaming_visibility(q_pos, k_pos, sink_size, window)[jnp.newaxis, ...], (lb, T, T))
         with shardtypes.Scope():
             logits, _, _ = w.forward_pass(h, full_ids, mask)
         pred = jnp.argmax(logits[:, P - 1 : T - 1], axis=-1).astype(jnp.uint32)  # predicts positions P..T-1
@@ -148,6 +181,9 @@ def main():
     p.add_argument("--batch", type=int, default=8, help="must be divisible by mesh d")
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--sink", type=int, default=0, help="StreamingLLM sink size (with --window)")
+    p.add_argument("--window", type=int, default=None,
+                   help="StreamingLLM sliding-window size incl. current token; omit for dense attention")
     p.add_argument("--check", action="store_true", help="verify greedy output against the non-cached forward pass")
     args = p.parse_args()
 
@@ -172,7 +208,8 @@ def main():
             jax.random.PRNGKey(args.seed), (args.batch, args.prompt_len), 0, h.vocab
         ).astype(jnp.uint32)
 
-        generate = make_generate(h, args.prompt_len, args.gen_len, args.temperature)
+        generate = make_generate(h, args.prompt_len, args.gen_len, args.temperature,
+                                 sink_size=args.sink, window=args.window)
         generated = generate(weights, prompt, rng)
         print("prompt[0]:   ", prompt[0].tolist())
         print("generated[0]:", generated[0].tolist())
@@ -181,7 +218,8 @@ def main():
             if args.temperature != 0.0:
                 print("--check requires greedy decoding (temperature 0); skipping")
             else:
-                check = make_greedy_check(h, args.prompt_len, args.gen_len)
+                check = make_greedy_check(h, args.prompt_len, args.gen_len,
+                                          sink_size=args.sink, window=args.window)
                 agree = check(weights, jnp.concatenate([prompt, generated], axis=1))
                 print(f"greedy agreement with non-cached forward pass: {float(agree):.4f}")
                 assert float(agree) == 1.0, "cached decode diverges from full forward pass"
