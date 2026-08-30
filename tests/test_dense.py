@@ -56,17 +56,17 @@ with Mesh(mesh_utils.create_device_mesh([8, 1, 1], jax.devices()), ("d", "t", "s
         mask = jnp.broadcast_to(k_pos <= q_pos, (lb, P, T))
         cache = jnp.zeros((h.layers, 2, lb, T, h.n_kv, h.d_head), dtype=jnp.bfloat16)
         with shardtypes.Scope():
-            logits, cache, _ = w.forward_pass(h, ids, mask, kv_cache=cache, kv_offset=jnp.int32(0))
+            logits, cache, _ = w.forward_pass(h, ids, mask, kv_cache=cache, kv_offset=jnp.zeros((lb,), jnp.int32))
         return logits, cache
 
     @jax.jit
     @partial(shardtypes.typed_shard_map, check_rep=False)
     @typechecked
     def decode_step(w: Model, tok: u32[b"B/d 1"], cache: bf16[b"layers 2 B/d T K D"],
-                    pos: i32[b""]) -> Tuple[f32[b"B/d 1 V"], bf16[b"layers 2 B/d T K D"]]:
+                    pos: i32[b"B/d"]) -> Tuple[f32[b"B/d 1 V"], bf16[b"layers 2 B/d T K D"]]:
         lb = tok.shape[0]
         k_pos = jnp.arange(T)[None, None, :]
-        mask = jnp.broadcast_to(k_pos <= pos, (lb, 1, T))
+        mask = jnp.broadcast_to(k_pos <= pos[:, None, None], (lb, 1, T))
         with shardtypes.Scope():
             logits, cache, _ = w.forward_pass(h, tok, mask, kv_cache=cache, kv_offset=pos)
         return logits, cache
@@ -74,7 +74,7 @@ with Mesh(mesh_utils.create_device_mesh([8, 1, 1], jax.devices()), ("d", "t", "s
     pre_logits, cache = prefill(weights, ids[:, :P])
     outs = [pre_logits]
     for t in range(P, T):
-        step_logits, cache = decode_step(weights, ids[:, t:t+1], cache, jnp.int32(t))
+        step_logits, cache = decode_step(weights, ids[:, t:t+1], cache, jnp.full((B,), t, jnp.int32))
         outs.append(step_logits)
     got = jnp.concatenate(outs, axis=1)
 

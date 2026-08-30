@@ -11,7 +11,11 @@ Differences from the NSA tag, in full:
   w_k, w_v, ln_k lose their leading `3` axis.
 - forward_pass: native_sparse_attention replaced by dense masked attention with
   RoPE; kv_cache shape is now [layers, 2, B, Klen, K, D] (no branch axis).
-- RoPE: q is rotated at absolute positions kv_offset..kv_offset+L-1; k is
+- kv_offset is a PER-SEQUENCE vector: row b of the batch writes its L new
+  tokens at cache positions kv_offset[b]..kv_offset[b]+L-1. This is what lets
+  speculative decoding advance each sequence by its own number of accepted
+  tokens. Uniform-progress callers pass jnp.full((B,), pos).
+- RoPE: q is rotated at absolute positions kv_offset[b]..kv_offset[b]+L-1; k is
   rotated over the full cache (positions 0..Klen-1) after the cache update, so
   the cache stores *unrotated* keys, as in the NSA tag.
 """
@@ -179,7 +183,9 @@ class Model:
         attention_mask: bool_[b"B/d L/s Klen"],
         rng: Optional[PRNGKey] = None,
         kv_cache: Optional[bf16[b"layers 2 B/d Klen K/t D"]] = None,
-        kv_offset: Optional[i32[b""]] = None,
+        kv_offset: Optional[i32[b"B/d"]] = None,
+        rope_q_positions: Optional[i32[b"B/d L/s"]] = None,  # explicit RoPE positions for queries
+        rope_k_positions: Optional[i32[b"B/d Klen"]] = None,  # explicit RoPE positions for cache keys
     ) -> Tuple[f32[b"B/d L/s V/t"], bf16[b"layers 2 B/d Klen K/t D"], "StatsDict"]:
         ##### Initial embedding lookup.
         embed = shardops.all_gather("V/t M/d/s -> V/t M", jnp.bfloat16(self.embed))
@@ -202,9 +208,21 @@ class Model:
         ) -> bf16[b"B/d L/s Q K/t D"]:
             # Rotate queries at their absolute positions; rotate keys over the full cache.
             # The cache stores unrotated keys, so this is correct for both training
-            # (kv_offset None, L == Klen) and decoding (kv_offset = write position).
-            q = jnp.bfloat16(rope_table.apply("L D -> 1 L 1 1 D", q, kv_offset))
-            k = jnp.bfloat16(rope_table.apply("L D -> 1 L 1 D", k, None))
+            # (kv_offset None, L == Klen) and decoding (kv_offset[b] = row b's write position).
+            # Explicit rope positions override the absolute-position scheme; this
+            # supports MagicDec's positions-within-the-cache convention, where a key's
+            # effective position is its rank in the compacted sparse cache.
+            if rope_q_positions is not None:
+                q = jnp.bfloat16(rope_table.apply_positions(q, rope_q_positions))
+            elif kv_offset is None:
+                q = jnp.bfloat16(rope_table.apply("L D -> 1 L 1 1 D", q, None))
+            else:
+                q_positions = kv_offset[:, jnp.newaxis] + jnp.arange(q.shape[1])[jnp.newaxis, :]  # [B, L]
+                q = jnp.bfloat16(rope_table.apply_positions(q, q_positions))
+            if rope_k_positions is not None:
+                k = jnp.bfloat16(rope_table.apply_rows(k, rope_k_positions))
+            else:
+                k = jnp.bfloat16(rope_table.apply("L D -> 1 L 1 D", k, None))
             # spec = "B/d L/s Q K/t D, B/d Klen K/t D -> B/d L/s Klen Q K/t"
             logits = jnp.einsum("b q Q K D, b k K D -> b q k Q K", q, k, preferred_element_type=jnp.float32)
             mask = attention_mask[:, :, :, jnp.newaxis, jnp.newaxis]
@@ -247,8 +265,9 @@ class Model:
             v = shardops.all_gather("B/d L/s K/t D -> B/d L K/t D", v)
             if kv_layer is not None:
                 prev_k, prev_v = kv_layer
-                k = jax.lax.dynamic_update_slice(prev_k, k, (0, kv_offset, 0, 0))
-                v = jax.lax.dynamic_update_slice(prev_v, v, (0, kv_offset, 0, 0))
+                update_row = jax.vmap(lambda prev, new, off: jax.lax.dynamic_update_slice(prev, new, (off, 0, 0)))
+                k = update_row(prev_k, k, kv_offset)
+                v = update_row(prev_v, v, kv_offset)
             qkv = dense_attention(q, k, v)
             ln_qkv = shardops.all_gather("Q K/t D/d/s -> Q K/t D", jnp.float32(layer_weights.ln_qkv))
             qkv = jnp.bfloat16(rms_norm(qkv) * ln_qkv)
@@ -350,6 +369,25 @@ class RopeTable:
         sin = jnp.sin(sinusoid_inp)
         cos = jnp.cos(sinusoid_inp)
         return RopeTable(sin=sin, cos=cos)
+
+    def apply_positions(self, x, positions):
+        """Rotate x[B, L, Q, K, D] at per-row absolute positions[B, L] (gather-based)."""
+        x1, x2 = jnp.split(x, 2, axis=-1)
+        sin = self.sin[positions][:, :, jnp.newaxis, jnp.newaxis, :]
+        cos = self.cos[positions][:, :, jnp.newaxis, jnp.newaxis, :]
+        r1 = x1 * cos - x2 * sin
+        r2 = x2 * cos + x1 * sin
+        return jnp.append(r1, r2, axis=-1)
+
+    def apply_rows(self, x, positions):
+        """Rotate x[B, L, ...heads..., D] at per-row absolute positions[B, L]."""
+        x1, x2 = jnp.split(x, 2, axis=-1)
+        extra = x.ndim - 3  # head dims between L and D
+        sin = jnp.take(self.sin, positions, axis=0).reshape(positions.shape + (1,) * extra + (-1,))
+        cos = jnp.take(self.cos, positions, axis=0).reshape(positions.shape + (1,) * extra + (-1,))
+        r1 = x1 * cos - x2 * sin
+        r2 = x2 * cos + x1 * sin
+        return jnp.append(r1, r2, axis=-1)
 
     def apply(self, rearrange_spec, x, offset):
         x1, x2 = jnp.split(x, 2, axis=-1)

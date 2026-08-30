@@ -107,14 +107,18 @@ def make_generate(h: ModelConfig, prompt_len: int, gen_len: int, temperature: fl
         q_pos = jnp.arange(P)[jnp.newaxis, :, jnp.newaxis]  # absolute positions 0..P-1
         prefill_mask = jnp.broadcast_to(streaming_visibility(q_pos, k_pos, sink_size, window), (lb, P, Klen))
         with shardtypes.Scope():
-            logits, cache, _ = w.forward_pass(h, prompt, prefill_mask, kv_cache=cache, kv_offset=jnp.int32(0))
+            logits, cache, _ = w.forward_pass(
+                h, prompt, prefill_mask, kv_cache=cache, kv_offset=jnp.zeros((lb,), jnp.int32)
+            )
         tok = _sample(logits[:, -1], rng, jnp.uint32(0), temperature)  # [lb]
 
         # ---- Decode loop: token at absolute position pos is written to the
         # cache and used to sample the token at position pos + 1. ----
         def step(carry, step_idx):
-            cache, tok, pos = carry
-            mask = jnp.broadcast_to(streaming_visibility(pos, k_pos, sink_size, window), (lb, 1, Klen))
+            cache, tok, pos = carry  # pos: i32[lb], uniform here but per-row capable
+            mask = jnp.broadcast_to(
+                streaming_visibility(pos[:, jnp.newaxis, jnp.newaxis], k_pos, sink_size, window), (lb, 1, Klen)
+            )
             with shardtypes.Scope():
                 logits, cache, _ = w.forward_pass(
                     h, tok[:, jnp.newaxis], mask, kv_cache=cache, kv_offset=pos
@@ -123,7 +127,7 @@ def make_generate(h: ModelConfig, prompt_len: int, gen_len: int, temperature: fl
             return (cache, next_tok, pos + 1), tok
 
         (_, last_tok, _), toks = jax.lax.scan(
-            step, (cache, tok, jnp.int32(P)), jnp.arange(G - 1, dtype=jnp.uint32)
+            step, (cache, tok, jnp.full((lb,), P, jnp.int32)), jnp.arange(G - 1, dtype=jnp.uint32)
         )
         # toks: [G-1, lb] tokens at positions P .. P+G-2; last_tok: position P+G-1
         out = jnp.concatenate([toks, last_tok[jnp.newaxis, :]], axis=0)
