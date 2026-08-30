@@ -486,8 +486,6 @@ def train_attempt(config: DictConfig):
 
 @hydra.main(config_path="configs", version_base=None)
 def main(config: DictConfig):
-    assert config.model.seq_len % config.model.nsa_L == 0, "We require l' | Klen"
-    assert config.model.nsa_n >= 3, "Always take 1st block, last 2 blocks"
     assert config.mesh.t == config.mesh.s == 1, "Tensor and sequence parallelism are not supported"
     assert config.dataset.sequence_packing, "Training without sequence packing is not supported"
     assert config.max_retries >= 0, "max_retries must be non-negative"
