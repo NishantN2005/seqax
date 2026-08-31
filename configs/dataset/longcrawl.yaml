@@ -1,8 +1,15 @@
-filespec: '/your/path/to/longcrawl64/longcrawl64-flat-tokens.zarr/'
+# LongCrawl64, built by tools/fetch_longcrawl64_subset.py + longcrawl64_to_flat_tokens.py.
+#
+# dataset_seqlen is 4096, not the 1024 this file used to carry. The loader keeps
+# only the first dataset_seqlen tokens of each document and splits them into
+# seqlen-sized training sequences, so at 1024 the available mirror (632,832
+# documents) yields just 0.65B tokens -- short of the 2.37B Chinchilla budget for
+# the 67M target. At 4096 it yields 2.59B. See docs/dataset.md.
+filespec: '/home/ubuntu/data/longcrawl64-flat-tokens.zarr'
 streams: 1
 read_blocks_per_shuffle_buffer: 1024
-sequences_per_read_block: 1024
+sequences_per_read_block: 256  # (1 << 20) / dataset_seqlen -> ~4GiB shuffle buffer
 seed: 1
-dataset_seqlen: 1024
+dataset_seqlen: 4096
 sequence_packing: True
 eval_tokens: 50331648
