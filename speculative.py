@@ -120,9 +120,13 @@ def make_speculative_generate(
     assert not (magicdec_rope and draft_window is None), "magicdec_rope requires a draft_window"
     Pn, R, V = prompt_len, num_rounds, h_target.vocab
     S = 1 + R * (k + 1)  # output buffer length (upper bound on tokens generated)
-    Klen = Pn + S + k + 1  # cache bound: last verify writes k+1 entries past the last committed pos
-    d_window = (Pn + S + k + 1) if draft_window is None else draft_window
-    d_prefill_window = (Pn + S + k + 1) if (draft_prefill_dense or draft_window is None) else draft_window
+    # BOS convention, same as decode.make_generate: the model reads ids[i] as the
+    # token BEFORE position i, so both caches are prefilled with [BOS, prompt...]
+    # and every absolute position is one greater than the prompt index it carries.
+    Pf = Pn + 1
+    Klen = Pf + S + k + 1  # cache bound: last verify writes k+1 entries past the last committed pos
+    d_window = Klen if draft_window is None else draft_window
+    d_prefill_window = Klen if (draft_prefill_dense or draft_window is None) else draft_window
 
     k_pos = jnp.arange(Klen)[jnp.newaxis, jnp.newaxis, :]
 
@@ -164,11 +168,12 @@ def make_speculative_generate(
         lb = prompt.shape[0]
         zero_pos = jnp.zeros((lb,), jnp.int32)
 
-        # ---- Prefill both caches over the prompt; first token comes from the target ----
+        # ---- Prefill both caches over [BOS || prompt]; first token comes from the target ----
         t_cache = jnp.zeros((h_target.layers, 2, lb, Klen, h_target.n_kv, h_target.d_head), jnp.bfloat16)
         d_cache = jnp.zeros((h_draft.layers, 2, lb, Klen, h_draft.n_kv, h_draft.d_head), jnp.bfloat16)
-        t_logits, t_cache, _ = target_forward(w_t, prompt, zero_pos)(t_cache)
-        _, d_cache, _ = draft_forward(w_d, prompt, zero_pos, d_prefill_window)(d_cache)
+        ids0 = jnp.concatenate([jnp.zeros((lb, 1), jnp.uint32), prompt], axis=1)  # [lb, Pf]
+        t_logits, t_cache, _ = target_forward(w_t, ids0, zero_pos)(t_cache)
+        _, d_cache, _ = draft_forward(w_d, ids0, zero_pos, d_prefill_window)(d_cache)
 
         p0 = _dists(t_logits[:, -1], temperature)
         if temperature == 0.0:
@@ -251,7 +256,7 @@ def make_speculative_generate(
                 final_tok[:, None],
                 jnp.concatenate([d_toks, jnp.zeros((lb, 1), jnp.uint32)], axis=1),
             )
-            cursor = pos - Pn + 1  # output index of position pos+1
+            cursor = pos - Pf + 1  # output index of position pos+1
             out = jax.vmap(lambda row, vec, c: jax.lax.dynamic_update_slice(row, vec, (c,)))(out, t_vec, cursor)
 
             # prev' = the committed token at new pos - 1: d_{n_acc} if any
@@ -263,10 +268,12 @@ def make_speculative_generate(
 
         (_, _, _, _, pos, out), n_accepted = jax.lax.scan(
             round_body,
-            (t_cache, d_cache, cur_tok, prompt[:, -1], jnp.full((lb,), Pn, jnp.int32), out),
+            # cur_tok sits at absolute position Pf (BOS occupies 0, prompt 1..Pn);
+            # prev_tok is the token at Pf-1, i.e. the last real prompt token.
+            (t_cache, d_cache, cur_tok, prompt[:, -1], jnp.full((lb,), Pf, jnp.int32), out),
             jnp.arange(R, dtype=jnp.int32),
         )
-        return out, pos - Pn + 1, jnp.transpose(n_accepted, (1, 0))
+        return out, pos - Pf + 1, jnp.transpose(n_accepted, (1, 0))
 
     model_spec = shardtypes.make_partition_specs(Model)
 

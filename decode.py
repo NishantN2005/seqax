@@ -89,11 +89,22 @@ def make_generate(h: ModelConfig, prompt_len: int, gen_len: int, temperature: fl
     window=None gives dense causal attention; otherwise a StreamingLLM
     sink + sliding-window mask (see module docstring).
     Recompiles for each distinct argument combination.
+
+    BOS convention: train.py's loss_fn feeds inputs = shift_right(targets) with
+    position 0 masked to token 0, and scores logits[i] against targets[i]. So the
+    model reads ids[i] as "the token BEFORE position i", and to predict the token
+    following a context c[0..m-1] it must be fed [BOS, c[0], ..., c[m-1]] and read
+    at index m. Feeding the raw prompt instead makes logits[-1] predict the token
+    just supplied, so greedy decoding echoes its own last token forever. The
+    sentinel is prepended here rather than by callers: the convention belongs to
+    the model, and a caller who forgets it gets silently degenerate output that
+    every self-comparison test still passes.
     """
     P, G = prompt_len, gen_len
+    Pf = P + 1  # prefilled length, including the BOS sentinel at position 0
+    Klen = Pf + G  # fixed cache size; the last generated token is never written back
     if window is None:
-        window = P + G  # window covers everything reachable -> exactly dense
-    Klen = P + G  # fixed cache size; the last generated token is never written back
+        window = Klen  # window covers everything reachable -> exactly dense
 
     @jax.jit
     @partial(shardtypes.typed_shard_map, check_rep=False)
@@ -102,13 +113,14 @@ def make_generate(h: ModelConfig, prompt_len: int, gen_len: int, temperature: fl
         lb = prompt.shape[0]  # local batch
         k_pos = jnp.arange(Klen)[jnp.newaxis, jnp.newaxis, :]  # [1, 1, Klen]
 
-        # ---- Prefill: fill cache positions [0, P), sample token P ----
+        # ---- Prefill: fill cache positions [0, Pf), sample the token after the prompt ----
         cache = jnp.zeros((h.layers, 2, lb, Klen, h.n_kv, h.d_head), dtype=jnp.bfloat16)
-        q_pos = jnp.arange(P)[jnp.newaxis, :, jnp.newaxis]  # absolute positions 0..P-1
-        prefill_mask = jnp.broadcast_to(streaming_visibility(q_pos, k_pos, sink_size, window), (lb, P, Klen))
+        ids = jnp.concatenate([jnp.zeros((lb, 1), jnp.uint32), prompt], axis=1)  # [lb, Pf]
+        q_pos = jnp.arange(Pf)[jnp.newaxis, :, jnp.newaxis]  # absolute positions 0..Pf-1
+        prefill_mask = jnp.broadcast_to(streaming_visibility(q_pos, k_pos, sink_size, window), (lb, Pf, Klen))
         with shardtypes.Scope():
             logits, cache, _ = w.forward_pass(
-                h, prompt, prefill_mask, kv_cache=cache, kv_offset=jnp.zeros((lb,), jnp.int32)
+                h, ids, prefill_mask, kv_cache=cache, kv_offset=jnp.zeros((lb,), jnp.int32)
             )
         tok = _sample(logits[:, -1], rng, jnp.uint32(0), temperature)  # [lb]
 
@@ -127,9 +139,9 @@ def make_generate(h: ModelConfig, prompt_len: int, gen_len: int, temperature: fl
             return (cache, next_tok, pos + 1), tok
 
         (_, last_tok, _), toks = jax.lax.scan(
-            step, (cache, tok, jnp.full((lb,), P, jnp.int32)), jnp.arange(G - 1, dtype=jnp.uint32)
+            step, (cache, tok, jnp.full((lb,), Pf, jnp.int32)), jnp.arange(G - 1, dtype=jnp.uint32)
         )
-        # toks: [G-1, lb] tokens at positions P .. P+G-2; last_tok: position P+G-1
+        # toks: [G-1, lb] tokens at positions Pf .. Pf+G-2; last_tok: position Pf+G-1
         out = jnp.concatenate([toks, last_tok[jnp.newaxis, :]], axis=0)
         return jnp.transpose(out, (1, 0))
 
@@ -138,25 +150,30 @@ def make_generate(h: ModelConfig, prompt_len: int, gen_len: int, temperature: fl
 
 def make_greedy_check(h: ModelConfig, prompt_len: int, gen_len: int,
                       sink_size: int = 0, window: int | None = None):
-    """Reference check: teacher-force [prompt || generated] through the full
+    """Reference check: teacher-force [BOS || prompt || generated] through the full
     non-cached forward pass; greedy generation is correct iff generated[t] equals
-    argmax of the full-pass logits at the preceding position, for every t."""
+    argmax of the full-pass logits at the same shifted index, for every t.
+
+    Uses the same BOS convention as make_generate (see its docstring), so with the
+    sentinel prepended, logits[i] predicts full_ids[i] directly -- no -1 offset."""
     P, G = prompt_len, gen_len
     T = P + G
+    Tf = T + 1  # includes the BOS sentinel
     if window is None:
-        window = T
+        window = Tf
 
     @jax.jit
     @partial(shardtypes.typed_shard_map, check_rep=False)
     @typechecked
     def check(w: Model, full_ids: u32[b"B/d T"]) -> f32[b""]:
         lb = full_ids.shape[0]
-        q_pos = jnp.arange(T)[:, jnp.newaxis]
-        k_pos = jnp.arange(T)[jnp.newaxis, :]
-        mask = jnp.broadcast_to(streaming_visibility(q_pos, k_pos, sink_size, window)[jnp.newaxis, ...], (lb, T, T))
+        ids = jnp.concatenate([jnp.zeros((lb, 1), jnp.uint32), full_ids], axis=1)  # [lb, Tf]
+        q_pos = jnp.arange(Tf)[:, jnp.newaxis]
+        k_pos = jnp.arange(Tf)[jnp.newaxis, :]
+        mask = jnp.broadcast_to(streaming_visibility(q_pos, k_pos, sink_size, window)[jnp.newaxis, ...], (lb, Tf, Tf))
         with shardtypes.Scope():
-            logits, _, _ = w.forward_pass(h, full_ids, mask)
-        pred = jnp.argmax(logits[:, P - 1 : T - 1], axis=-1).astype(jnp.uint32)  # predicts positions P..T-1
+            logits, _, _ = w.forward_pass(h, ids, mask)
+        pred = jnp.argmax(logits[:, P:T], axis=-1).astype(jnp.uint32)  # predicts full_ids[P..T-1]
         agree = jnp.mean((pred == full_ids[:, P:]).astype(jnp.float32))
         return jax.lax.pmean(agree, ("d", "t", "s"))
 

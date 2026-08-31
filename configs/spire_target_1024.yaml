@@ -1,0 +1,66 @@
+# SPIRe reproduction: the 67M target, trained at seq_len 1024 (the paper's length).
+#
+#   python -m train --config-name=spire_target_1024 +model_name=spire_target_1024
+#
+# Architecture is pinned by the paper (arXiv:2504.06419) and cross-checked against
+# the printed parameter counts in spire_appendix.ipynb @ the SPIRe tag:
+#   body       = 8 * (2*d_model + 4*d_model*n_kv*d_head + 3*d_model*d_ff) = 67,117,056
+#   total      = body + 2*vocab*d_model                                   = 118,628,352
+#   token budget = 20 * total (Chinchilla, "~20 tokens/param")            = 2,372,567,040
+#
+# Everything under `optimizer` except the token budget is UNSPECIFIED by the paper.
+# These are our choices and must be reported as such:
+#   batch_size    -- 64 is a ceiling, not a preference. The unembedding produces
+#                    [B, 1024, 50304] f32 logits (206 MB per sequence) and the
+#                    backward needs several copies; batch 128 asks XLA for 105 GB
+#                    and OOMs at any --xla mem fraction. Batch 64 also measured
+#                    FASTER per token than 96 (131K vs 115K tok/s), so nothing is
+#                    lost. ~11% MFU, which is what a 98:1 vocab:d_model ratio buys.
+#   learning_rate -- 3e-3, chosen empirically. seqax's longcrawl_184m uses 6.5e-3
+#                    but at 8x this batch (524K tokens vs 65K), so it is not
+#                    transferable as-is. A 1200-step probe with a full scaled-down
+#                    schedule gave final loss 3.609 / 3.581 / 3.649 at
+#                    6.5e-3 / 3e-3 / 1.5e-3 -- a 2% spread with no divergence
+#                    anywhere, so this range is flat and gradient clipping to
+#                    global norm 1.0 is doing the stabilizing. 3e-3 won narrowly.
+#                    Caveat for the write-up: a 1200-step proxy need not rank LRs
+#                    the same way a 36,203-step run does.
+#   warmup        -- 10% of steps, matching seqax's longcrawl configs (1907/19070)
+#   final fraction -- 0.01, likewise
+defaults:
+  - base
+  - dataset/longcrawl
+  - _self_
+
+root_working_dir: '/home/ubuntu/runs'
+
+model:
+  vocab: 50304
+  seq_len: 1024
+  layers: 8
+  d_model: 512
+  n_q_per_kv: 1  # MHA: 8 query heads, 8 KV heads
+  n_kv: 8
+  d_head: 128
+  d_ff: 4096
+  rope_max_timescale: 10000
+
+optimizer:
+  batch_size: 64                # 64 * 1024 = 65,536 tokens/step
+  learning_rate: 3.0e-3
+  steps: 36203                  # 2,372,567,040 / 65,536
+  warmup_steps: 3620
+  steps_for_lr: 36203
+  cosine_learning_rate_final_fraction: 0.01
+  adam_atan2_a: null
+  adam_atan2_b: null
+
+mesh:
+  d: 1  # single H100; base.yaml assumes 8-way data parallelism
+  t: 1
+  s: 1
+
+# NOTE: dataset.eval_tokens must be an exact multiple of batch_size * seq_len, or
+# training aborts with a ValueError AFTER the model is built. 50,331,648 (inherited
+# from dataset/longcrawl) is 768 * 65,536, so it is valid for batch_size 64.
+checkpoint_interval: 4000
