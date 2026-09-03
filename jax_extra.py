@@ -1,7 +1,7 @@
 """Extra utilities for JAX and Python."""
 
 import hashlib
-from dataclasses import fields, is_dataclass
+from dataclasses import MISSING, fields, is_dataclass
 from typing import Union, get_args
 
 import jax
@@ -47,6 +47,12 @@ def make_dataclass_from_dict(cls, data):
         raise ValueError(f"Expected a {cls.__name__}, got None instead.")
     field_data = {}
     for field in fields(cls):
+        if field.name not in data and field.default is not MISSING:
+            # Honor the dataclass default rather than injecting None. Without this,
+            # adding an optional field to a config dataclass breaks every existing
+            # YAML that predates it.
+            field_data[field.name] = field.default
+            continue
         field_value = data.get(field.name)
         if hasattr(field.type, "__origin__") and field.type.__origin__ is Union:
             field_data[field.name] = _handle_union(field.name, field_value, get_args(field.type))

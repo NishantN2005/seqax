@@ -536,10 +536,28 @@ def load_zarr(filename: str, state: PyTree, config: IOConfig, path_prefix: str =
             "zarr 'write_completed' marker is missing. Should not have selected this checkpoint to load from."
         )
 
+    missing: list[str] = []
+
     def load_one(path: Tuple, prev: jax.Array) -> jax.Array:
         path = path_prefix + jax.tree_util.keystr(path)
         shape = prev.shape
         sharding = prev.sharding
+        if path not in root:
+            # Leaf absent from this checkpoint: keep the freshly-initialized value.
+            #
+            # Checkpoint keys are derived from pytree paths, so ADDING a field to
+            # Model or State makes every older checkpoint unloadable -- the new leaf
+            # simply is not on disk. Without this fallback, introducing SPIRe's
+            # w_memory would strand the trained target, vanilla draft, and Phase A
+            # draft. Tolerating absence lets a new field arrive at its init value
+            # (zeros for w_memory, an exact no-op) while every stored leaf still
+            # loads exactly as before.
+            #
+            # The names are reported rather than swallowed: a typo'd field would
+            # otherwise silently train from its initializer instead of the
+            # checkpoint, which is far worse than a loud failure.
+            missing.append(path)
+            return prev
         arr = root[path]
         assert arr.shape == shape, f"Expected shape {shape} but got {arr.shape} for {path} in {filename}"
         assert arr.dtype == prev.dtype, f"Expected dtype {prev.dtype} but got {arr.dtype} for {path} in {filename}"
@@ -550,6 +568,11 @@ def load_zarr(filename: str, state: PyTree, config: IOConfig, path_prefix: str =
     with concurrent.futures.ThreadPoolExecutor(max_workers=config.max_io_threads) as executor:
         state_futures = [executor.submit(load_one, path, shape) for (path, shape) in state]
         states = [f.result() for f in state_futures]
+    if missing:
+        print(
+            f"[checkpoint] {len(missing)} leaf/leaves absent from {filename}, kept at initialized "
+            f"values: {', '.join(sorted(missing)[:8])}{' ...' if len(missing) > 8 else ''}"
+        )
     return jax.tree_util.tree_unflatten(treedef, states)
 
 
