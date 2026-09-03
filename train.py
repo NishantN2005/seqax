@@ -14,7 +14,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from functools import partial
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import hydra
 import jax
@@ -35,7 +35,7 @@ import training_io
 from init_seqax import is_tpu
 from input_loader import ShufflingLoader, TokenBatch
 from jax_extra import fold_in_str
-from model import MeshConfig, Model, ModelConfig, StatsDict, TensorStats
+from model import MeshConfig, Model, ModelConfig, StatsDict, TensorStats, streaming_visibility
 from shardlib.shardtypes import bool_, f32, pytree_dataclass, u32
 
 shardtypes.register_with_typeguard()
@@ -45,8 +45,31 @@ PRNGKey = u32[b"2"]  # Type annotation to enable run-time typechecking of PRNGKe
 
 @typechecked
 def loss_fn(
-    model: Model, h: ModelConfig, batch: TokenBatch, rng: Optional[PRNGKey] = None
+    model: Model,
+    h: ModelConfig,
+    batch: TokenBatch,
+    rng: Optional[PRNGKey] = None,
+    # Annotated Any, not Model, deliberately: shardtypes' runtime checker binds the
+    # `layers` dimension from the student and would reject a teacher of different
+    # depth (8 vs 2) as a shape error. It is a Model.
+    teacher: Optional[Any] = None,
+    h_teacher: Optional[ModelConfig] = None,
+    omega: float = 0.5,
 ) -> Tuple[f32[b""], StatsDict]:
+    """Next-token loss, optionally sparse-masked and distilled.
+
+    With `teacher` supplied this computes SPIRe's MixedLoss instead of hard-target
+    cross-entropy:
+
+        MixedLoss(w) = w * CE(p_teacher || q_student) + (1 - w) * (-alpha)
+
+    where alpha is Leviathan's expected acceptance probability. For a single token,
+    alpha = E_{x~q}[min(1, p(x)/q(x))] = sum_x min(p(x), q(x)) -- the overlap of the
+    two distributions, i.e. 1 - TV(p, q). Optimizing it directly targets the
+    deployment metric rather than a proxy for it.
+
+    Figure 5 prices these at 0.332 tau for distillation and 0.026 for the alpha term,
+    against 3.401 for full SPIRe."""
     # Given sequence-packed targets:
     #   [[1, 2], [3, 4, 5], [6, 7, 8, 9]]
     # we want inputs:
@@ -63,10 +86,91 @@ def loss_fn(
     segment_ids = jnp.cumsum(shardops.all_gather("B/d L/s -> B/d L", is_seq_start), axis=1)
     segment_mask: bool_[b"B/d L L"] = segment_ids[:, :, jnp.newaxis] == segment_ids[:, jnp.newaxis, :]
     causal_mask: bool_[b"1 L L"] = jnp.tril(jnp.ones((L, L), dtype=jnp.bool_), 0)[jnp.newaxis, ...]
-    causal_mask: bool_[b"B/d L L"] = jnp.logical_and(segment_mask, causal_mask)
-    causal_mask: bool_[b"B/d L/s L"] = shardops.shard(causal_mask, "B/d L L -> B/d L/s L")
+    dense_mask: bool_[b"B/d L L"] = jnp.logical_and(segment_mask, causal_mask)
 
-    logits, _, tensor_stats = model.forward_pass(h, inputs, causal_mask, rng)
+    # SPIRe's draft trains WITH the sparse mask, not just at decode -- that is the
+    # whole difference between it and the MagicDec baseline. Build the student's
+    # mask from ModelConfig so training and decode cannot disagree.
+    if h.attention_mask == "streaming_llm":
+        assert h.window is not None, "streaming_llm attention requires model.window"
+        pos = jnp.arange(L)
+        vis: bool_[b"1 L L"] = streaming_visibility(pos[:, jnp.newaxis], pos[jnp.newaxis, :], h.sink_size, h.window)[
+            jnp.newaxis, ...
+        ]
+        student_mask: bool_[b"B/d L L"] = jnp.logical_and(dense_mask, vis)
+    elif h.attention_mask == "dense":
+        student_mask = dense_mask
+    else:
+        raise ValueError(f"unknown attention_mask {h.attention_mask!r}")
+
+    causal_mask: bool_[b"B/d L/s L"] = shardops.shard(student_mask, "B/d L L -> B/d L/s L")
+
+    # ---- Teacher first: it supplies both the distillation targets and, when the
+    # student declares memory slots, the activations that fill them. ----
+    t_acts = None
+    if teacher is not None:
+        assert h_teacher is not None, "distillation requires the teacher's ModelConfig"
+        # The teacher is the dense-attention target; it must see its own mask, not
+        # the student's sparse one, or we would distill from a crippled teacher.
+        teacher_mask: bool_[b"B/d L/s L"] = shardops.shard(dense_mask, "B/d L L -> B/d L/s L")
+        # shardlib dimension names are global; a teacher of different depth collides
+        # with the student's `layers` binding without its own Scope.
+        with shardtypes.Scope():
+            t_out = teacher.forward_pass(
+                h_teacher, inputs, teacher_mask, emit_activations=(h.n_mem > 0)
+            )
+        t_logits = lax.stop_gradient(t_out[0])
+        if h.n_mem > 0:
+            t_acts = lax.stop_gradient(t_out[3])
+
+    # ---- SPIRe target-activation substitution ----
+    # Pruned init sets draft layer j := target layer j+first, so the input that
+    # target layer j+first saw is target layer (j+first-1)'s output. Handing the
+    # draft that activation restores the context those layers lost when they were
+    # torn out of the stack -- which is what `m_t^i = y_t^{i+6-1}` says, with the
+    # paper's 1-indexing. n_mem = layers+1 covers the draft's own residual states
+    # (embedding output plus each layer output), whose target counterparts are the
+    # window [first-1, first-1+n_mem).
+    # No teacher (evaluation, or plain CE training) means no activations to inject,
+    # so the pathway is simply off and w_memory is unused. This is NOT an error: it
+    # is exactly the decode-time condition, where the target's activations for the
+    # positions being drafted do not exist. Asserting here instead crashed a
+    # completed 20,841-step run during its final eval pass.
+    memory = None
+    if h.n_mem > 0 and t_acts is not None:
+        first = h_teacher.layers - h.layers
+        lo = first - 1
+        assert lo >= 0 and lo + h.n_mem <= h_teacher.layers, (
+            f"memory window [{lo}, {lo + h.n_mem}) does not fit a {h_teacher.layers}-layer teacher"
+        )
+        memory = t_acts[lo : lo + h.n_mem]
+
+        # ---- Rollout split: train the draft under the DEPLOYMENT memory condition ----
+        # At decode the draft only ever has target activations for prompt positions:
+        # its cache over the prompt is built during prefill, where both models
+        # consume the same committed tokens. Every position it *generates* is
+        # produced with no memory at all -- the target has not seen those tokens,
+        # and the newly committed token is one the target produced rather than
+        # consumed, so even the first draft step has nothing.
+        #
+        # Training with memory everywhere therefore teaches the draft to rely on a
+        # signal that is absent exactly when it matters. Two runs confirmed this the
+        # hard way: the draft learns a 0.418-weighted memory term, then scores
+        # eval loss 12.88 and tau ~= 1.00 without it -- unusable, not merely worse.
+        #
+        # So we zero the memory past a split point, mimicking the prompt/generation
+        # boundary. The split is resampled each step so the draft is never tuned to
+        # one prompt length. This is our reading of `t <= S-k` and `train_rollout_k`;
+        # the paper pins neither the split nor the decode-time source (ledger 3.7).
+        if rng is not None:
+            split = jax.random.randint(fold_in_str(rng, "rollout_split"), (), L // 4, L + 1)
+            keep = (jnp.arange(L) < split)[jnp.newaxis, jnp.newaxis, :, jnp.newaxis]
+            memory = memory * keep.astype(memory.dtype)
+
+    with shardtypes.Scope():
+        logits, _, tensor_stats = model.forward_pass(
+            h, inputs, causal_mask, rng, memory=memory, w_memory=(model.w_memory if h.n_mem > 0 else None)
+        )
     max_logits: f32[b"B/d L/s 1"] = lax.pmax(jnp.max(lax.stop_gradient(logits), axis=-1, keepdims=True), "t")
     logits = logits - max_logits
     sum_logits = lax.psum(jnp.sum(jnp.exp(logits), axis=-1, keepdims=True), "t")
@@ -77,7 +181,44 @@ def loss_fn(
     )
     logprobs_at_targets = shardops.psum_scatter("B/d L/s -> B/d L/s/t", logprobs_at_targets)
     tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t", "s"))
-    return -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch), tensor_stats
+
+    if teacher is None:
+        return -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch), tensor_stats
+
+    # ---- SPIRe MixedLoss: distillation CE against the frozen target, plus alpha ----
+    t_max: f32[b"B/d L/s 1"] = lax.pmax(jnp.max(t_logits, axis=-1, keepdims=True), "t")
+    t_logits = t_logits - t_max
+    t_logsumexp = jnp.log(lax.psum(jnp.sum(jnp.exp(t_logits), axis=-1, keepdims=True), "t"))
+    p: f32[b"B/d L/s V/t"] = jnp.exp(t_logits - t_logsumexp)
+
+    # Both terms follow the hard-target pattern above: compute a partial sum over
+    # the local vocab shard, psum_scatter to complete and re-shard it, then divide
+    # by the global token count. The outer psum in training_step finishes the job.
+    ce_partial: f32[b"B/d L/s"] = -jnp.sum(p * logprobs, axis=-1)
+    ce_per_token = shardops.psum_scatter("B/d L/s -> B/d L/s/t", ce_partial)
+    distill_ce = jnp.sum(ce_per_token) / jnp.float32(tokens_in_global_batch)
+
+    q: f32[b"B/d L/s V/t"] = jnp.exp(logprobs)
+    alpha_partial: f32[b"B/d L/s"] = jnp.sum(jnp.minimum(p, q), axis=-1)
+    alpha_per_token = shardops.psum_scatter("B/d L/s -> B/d L/s/t", alpha_partial)
+    alpha = jnp.sum(alpha_per_token) / jnp.float32(tokens_in_global_batch)
+
+    # Report both components and the hard-target CE, so the loss curve stays
+    # interpretable and alpha can be watched directly -- it is the quantity tau
+    # ultimately depends on, and it should climb toward ~0.7 (Table 1's acceptance
+    # rates) rather than toward 1.
+    #
+    # These are per-device partials, like `loss` itself, which training_step
+    # finishes with a psum. TensorStats.from_tensor applies a pmean, so scale by
+    # the device count first to make pmean recover the sum. Exact at any mesh size;
+    # a no-op at d=t=s=1.
+    n_dev = jax.lax.psum(1, ("d", "t", "s"))
+    hard_ce = -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
+    tensor_stats["loss.distill_ce"] = TensorStats.from_tensor(distill_ce * n_dev)
+    tensor_stats["loss.alpha"] = TensorStats.from_tensor(alpha * n_dev)
+    tensor_stats["loss.hard_ce"] = TensorStats.from_tensor(hard_ce * n_dev)
+
+    return omega * distill_ce + (1.0 - omega) * (-alpha), tensor_stats
 
 
 @pytree_dataclass
@@ -127,18 +268,29 @@ class State:
         return State(weights=self.weights, adam_mu=adam_mu, adam_nu=adam_nu)
 
 
-@partial(jax.jit, static_argnames=("config",), donate_argnums=(0,))
-def training_step(state: State, config: "TrainingConfig", step: u32[b""], batch: TokenBatch) -> Tuple[State, Metrics]:
-    @partial(
-        shardtypes.typed_shard_map, check_rep=False
-    )  # check_rep=False for https://github.com/google/jax/issues/20335
-    def sharded_step(state: State, step: u32[b""], batch: TokenBatch) -> Tuple[State, Metrics]:
+@partial(jax.jit, static_argnames=("config", "h_teacher"), donate_argnums=(0,))
+def training_step(
+    state: State,
+    config: "TrainingConfig",
+    step: u32[b""],
+    batch: TokenBatch,
+    teacher: Optional[Model] = None,
+    h_teacher: Optional[ModelConfig] = None,
+) -> Tuple[State, Metrics]:
+    """One optimizer step. `teacher` is frozen weights for SPIRe distillation;
+    it is passed as a traced argument (not part of `state`) so no gradient can
+    reach it and it is never checkpointed."""
+
+    def _body(state: State, step, batch: TokenBatch, teacher) -> Tuple[State, Metrics]:
         # Create PRNG key from base seed and current step
         rng = jax.random.PRNGKey(config.einsum_seed)
         rng = fold_in_str(rng, f"step_{step}")
 
         (loss, tensor_stats), grad = jax.value_and_grad(
-            lambda weights: loss_fn(weights, config.model, batch, rng), has_aux=True
+            lambda weights: loss_fn(
+                weights, config.model, batch, rng, teacher, h_teacher, config.distill.omega
+            ),
+            has_aux=True,
         )(state.weights)
 
         # if you want to include the FWD / BWD / OPT annotations in the HLO SVG, comment the last three lines
@@ -268,7 +420,32 @@ def training_step(state: State, config: "TrainingConfig", step: u32[b""], batch:
         )
         return new_state, metrics
 
+    # The teacher is CLOSED OVER rather than passed as a parameter. Two shardlib
+    # constraints force this:
+    #   * an `Optional[Model]` annotation reaches typed_shard_map's issubclass()
+    #     check as a Union and raises;
+    #   * a concrete `Model` annotation type-checks the teacher against dimension
+    #     names already bound by the student, and `layers` differs (8 vs 2).
+    # Closing over sidesteps both, at the cost of the teacher being replicated
+    # rather than sharded inside shard_map. That is exactly correct on a 1x1x1
+    # mesh and wrong on anything larger, so main() asserts the mesh is single-device
+    # whenever distillation is enabled.
+    @partial(shardtypes.typed_shard_map, check_rep=False)
+    def sharded_step(state: State, step: u32[b""], batch: TokenBatch) -> Tuple[State, Metrics]:
+        return _body(state, step, batch, teacher)
+
     return sharded_step(state, step, batch)
+
+
+@dataclass(frozen=True)
+class DistillConfig:
+    """SPIRe MixedLoss. `enabled: false` (the base.yaml default) leaves training as
+    plain hard-target cross-entropy, so every pre-existing config is unaffected."""
+
+    enabled: bool
+    teacher_config: str  # config name under configs/, for the teacher's ModelConfig
+    teacher_name: str  # run dir under root_working_dir holding the teacher checkpoint
+    omega: float  # w in w*distill_CE + (1-w)*(-alpha); paper uses 0.5
 
 
 @dataclass(frozen=True)
@@ -281,6 +458,7 @@ class TrainingConfig:
     log_tensor_stats: bool
     model: ModelConfig
     optimizer: OptimizerConfig
+    distill: DistillConfig
     dataset: input_loader.FlatTokensParams
     weight_init_seed: int
     einsum_seed: int
@@ -371,9 +549,40 @@ def train_attempt(config: DictConfig):
             }
             training_io.log_attributes(zarr_log, firestore_log, attributes)
 
+        # ---- SPIRe distillation: load the frozen teacher once, before compiling ----
+        teacher, h_teacher = None, None
+        if config.distill.enabled:
+            # training_step closes over the teacher instead of passing it through
+            # shard_map (see the comment there), which replicates rather than shards
+            # it. Correct on one device, silently wrong on more.
+            assert config.mesh.d == config.mesh.t == config.mesh.s == 1, (
+                "distillation currently requires a 1x1x1 mesh; the teacher is closed "
+                "over rather than sharded. Plumb it through shard_map before scaling out."
+            )
+            teacher_cfg = OmegaConf.load(f"configs/{config.distill.teacher_config}.yaml")
+            h_teacher = ModelConfig(**teacher_cfg.model)
+            teacher_dir = os.path.join(config.root_working_dir, config.distill.teacher_name)
+            # Fresh Scope: the teacher's `layers` differs from the student's, and
+            # shardlib's dimension names are global.
+            with shardtypes.Scope():
+                t_state = jax.jit(partial(State.init, h_teacher))(fold_in_str(weight_rng, "teacher_init"))
+                t_state, t_step = training_io.load_checkpoint_if_it_exists(teacher_dir, t_state, config.io)
+            if t_step == 0:
+                raise FileNotFoundError(f"distillation enabled but no teacher checkpoint in {teacher_dir}")
+            # Weights only. Dropping the optimizer state keeps ~950MB off the device
+            # and makes it structurally impossible to update the teacher.
+            teacher = jax.tree.map(lambda x: x, t_state.weights)
+            del t_state
+            print(
+                f"distilling from {config.distill.teacher_name} step {t_step} "
+                f"({h_teacher.layers} layers), omega={config.distill.omega}"
+            )
+
         # Explicitly compile training step, to record XLA HLO graph.
         # See https://bnikolic.co.uk/blog/python/jax/2022/02/22/jax-outputgraph-rev
-        c_training_step = training_step.lower(state, config, jnp.uint32(0), loader.load(0)).compile()
+        c_training_step = training_step.lower(
+            state, config, jnp.uint32(0), loader.load(0), teacher, h_teacher
+        ).compile()
         date = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
         training_io.save_hlo_dot(os.path.join(model_dir, f"training_step_optimized_hlo_{date}.dot"), c_training_step)
         multihost_utils.sync_global_devices("train_attempt_init")
@@ -399,6 +608,7 @@ def train_attempt(config: DictConfig):
                 state,
                 jnp.uint32(current_run_step),
                 loader.load(current_run_step + config.optimizer.dataloader_steps_offset),
+                teacher,
             )
 
             # Run profile for two steps, to include data loading time in between them.

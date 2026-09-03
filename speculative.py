@@ -130,19 +130,25 @@ def make_speculative_generate(
 
     k_pos = jnp.arange(Klen)[jnp.newaxis, jnp.newaxis, :]
 
-    def target_forward(w, ids, pos):
-        """Target forward over ids[B, L] at per-row offsets pos[B]; dense causal."""
+    def target_forward(w, ids, pos, emit_acts: bool = False):
+        """Target forward over ids[B, L] at per-row offsets pos[B]; dense causal.
+
+        `emit_acts` returns per-layer activations as a 4th value, which is how the
+        draft gets SPIRe's feedback memory at prefill -- the target processes the
+        prompt anyway, so keeping those activations costs nothing."""
         lb, L = ids.shape
         q_pos = pos[:, None, None] + jnp.arange(L)[None, :, None]
         mask = jnp.broadcast_to(k_pos <= q_pos, (lb, L, Klen))
 
         def run(cache):
             with shardtypes.Scope():
-                return w.forward_pass(h_target, ids, mask, kv_cache=cache, kv_offset=pos)
+                return w.forward_pass(
+                    h_target, ids, mask, kv_cache=cache, kv_offset=pos, emit_activations=emit_acts
+                )
 
         return run
 
-    def draft_forward(w, ids, pos, window, cache_relative_rope=False):
+    def draft_forward(w, ids, pos, window, cache_relative_rope=False, memory=None):
         lb, L = ids.shape
         q_pos = pos[:, None, None] + jnp.arange(L)[None, :, None]
         mask = jnp.broadcast_to(streaming_visibility(q_pos, k_pos, draft_sink, window), (lb, L, Klen))
@@ -160,6 +166,7 @@ def make_speculative_generate(
                 return w.forward_pass(
                     h_draft, ids, mask, kv_cache=cache, kv_offset=pos,
                     rope_q_positions=rope_q, rope_k_positions=rope_k,
+                    memory=memory, w_memory=(w.w_memory if memory is not None else None),
                 )
 
         return run
@@ -172,8 +179,30 @@ def make_speculative_generate(
         t_cache = jnp.zeros((h_target.layers, 2, lb, Klen, h_target.n_kv, h_target.d_head), jnp.bfloat16)
         d_cache = jnp.zeros((h_draft.layers, 2, lb, Klen, h_draft.n_kv, h_draft.d_head), jnp.bfloat16)
         ids0 = jnp.concatenate([jnp.zeros((lb, 1), jnp.uint32), prompt], axis=1)  # [lb, Pf]
-        t_logits, t_cache, _ = target_forward(w_t, ids0, zero_pos)(t_cache)
-        _, d_cache, _ = draft_forward(w_d, ids0, zero_pos, d_prefill_window)(d_cache)
+        # SPIRe feedback memory at prefill. Both models consume the SAME committed
+        # prompt tokens here, so the target's activations at these positions are
+        # valid and already computed -- injecting them costs no extra forward pass
+        # and does not touch the speculative-decoding economics.
+        #
+        # This covers the prompt only. The k in-flight positions the draft
+        # speculates have no target activations by construction (the target has not
+        # seen those tokens), so they get none -- reading A of fidelity-ledger
+        # 3.7. For a 512-token context that is ~508 positions with real memory
+        # against the handful without.
+        use_mem = h_draft.n_mem > 0
+        t_out = target_forward(w_t, ids0, zero_pos, emit_acts=use_mem)(t_cache)
+        t_logits, t_cache = t_out[0], t_out[1]
+        prefill_mem = None
+        if use_mem:
+            # Draft layer j is target layer j+first, whose input is layer
+            # (j+first-1)'s output; the bank is the window starting there.
+            lo = h_target.layers - h_draft.layers - 1
+            assert lo >= 0 and lo + h_draft.n_mem <= h_target.layers, (
+                f"memory window [{lo}, {lo + h_draft.n_mem}) does not fit "
+                f"a {h_target.layers}-layer target"
+            )
+            prefill_mem = t_out[3][lo : lo + h_draft.n_mem]
+        _, d_cache, _ = draft_forward(w_d, ids0, zero_pos, d_prefill_window, memory=prefill_mem)(d_cache)
 
         p0 = _dists(t_logits[:, -1], temperature)
         if temperature == 0.0:

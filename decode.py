@@ -54,22 +54,15 @@ from typeguard import typechecked
 
 import shardlib.shardtypes as shardtypes
 import training_io
-from model import Model, ModelConfig
+from model import Model, ModelConfig, streaming_visibility  # noqa: F401  (re-exported)
 from shardlib.shardtypes import bf16, bool_, f32, i32, u32
 
 shardtypes.register_with_typeguard()
 PRNGKey = u32[b"2"]
 
-
-def streaming_visibility(q_pos: jax.Array, k_pos: jax.Array, sink_size: int, window: int) -> jax.Array:
-    """StreamingLLM visibility: causal AND (sink OR within sliding window).
-
-    q_pos, k_pos are absolute positions (broadcastable). `window` includes the
-    current token: window=1 means each token sees only itself (plus sinks).
-    """
-    causal = k_pos <= q_pos
-    visible = jnp.logical_or(k_pos < sink_size, k_pos > q_pos - window)
-    return jnp.logical_and(causal, visible)
+# streaming_visibility moved to model.py so train.py can build the identical mask
+# without importing decode (which imports train for State). Re-exported here
+# because speculative.py and tests/test_streaming.py import it from this module.
 
 
 def _sample(logits: jax.Array, rng: jax.Array, step: jax.Array, temperature: float) -> jax.Array:

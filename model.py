@@ -63,6 +63,39 @@ class ModelConfig:
     d_ff: int
     rope_max_timescale: int
 
+    # StreamingLLM sink + sliding-window attention, applied during TRAINING as
+    # well as inference. This is what distinguishes SPIRe's draft (trained sparse)
+    # from MagicDec's baseline (dense weights, restricted only at decode).
+    #
+    # Defaults reproduce dense causal attention exactly, so every existing config,
+    # tool, and test is unaffected. Callers still build their own masks; these
+    # fields are the single source of truth for what mask to build, so training
+    # and decode cannot silently disagree about a draft's attention pattern.
+    attention_mask: str = "dense"  # "dense" | "streaming_llm"
+    sink_size: int = 0
+    window: Optional[int] = None
+
+    # Number of feedback-memory slots each layer mixes over. 0 disables the
+    # pathway and makes w_memory a zero-element array, so models that do not use
+    # it (target, vanilla draft) carry no extra parameters or storage.
+    n_mem: int = 0
+
+
+def streaming_visibility(q_pos: jax.Array, k_pos: jax.Array, sink_size: int, window: int) -> jax.Array:
+    """StreamingLLM visibility: causal AND (sink OR within sliding window).
+
+    q_pos, k_pos are absolute positions (broadcastable). `window` includes the
+    current token: window=1 means each token sees only itself (plus sinks).
+
+    Lives here, not in decode.py, because training and decode must build the same
+    mask from the same code. A SPIRe draft trained under one visibility rule and
+    decoded under another would show up only as a depressed tau -- indistinguishable
+    from a failed reproduction.
+    """
+    causal = k_pos <= q_pos
+    visible = jnp.logical_or(k_pos < sink_size, k_pos > q_pos - window)
+    return jnp.logical_and(causal, visible)
+
 
 @pytree_dataclass
 class TransformerLayer:
@@ -92,6 +125,10 @@ class Model:
     transformer: Transformer
     ln_embed: f32[b"d_model/t/d/s"]
     ln_final: f32[b"d_model/t/d/s"]
+    # SPIRe feedback-memory mixing weights, one row per layer. Zero-initialized so
+    # the pathway starts as an exact no-op; shape [layers, 0] when n_mem is 0.
+    # Replicated rather than sharded: it is at most layers x (layers+1) scalars.
+    w_memory: f32[b"layers n_mem"]
 
     @staticmethod
     @typechecked
@@ -140,6 +177,7 @@ class Model:
         )
 
         # https://github.com/google/jax/issues/20390 for ones_like with sharding.
+        w_memory = jnp.zeros((h.layers, h.n_mem), dtype=jnp.float32)
         ln_embed = jnp.ones((h.d_model,), dtype=jnp.float32)
         ln_attn_in = jnp.ones((h.layers, h.d_model), dtype=jnp.float32)
         ln_q = ln_q_scale * jnp.ones((h.layers, h.n_q_per_kv, h.n_kv, h.d_head), dtype=jnp.float32)
@@ -171,6 +209,7 @@ class Model:
             ),
             ln_embed=ln_embed,
             ln_final=ln_final,
+            w_memory=w_memory,
         )
         shardings = make_shardings(Model)
         return jax.tree.map(lax.with_sharding_constraint, arrays, shardings)
@@ -186,7 +225,30 @@ class Model:
         kv_offset: Optional[i32[b"B/d"]] = None,
         rope_q_positions: Optional[i32[b"B/d L/s"]] = None,  # explicit RoPE positions for queries
         rope_k_positions: Optional[i32[b"B/d Klen"]] = None,  # explicit RoPE positions for cache keys
-    ) -> Tuple[f32[b"B/d L/s V/t"], bf16[b"layers 2 B/d Klen K/t D"], "StatsDict"]:
+        emit_activations: bool = False,
+        memory: Optional[bf16[b"n_mem B/d L/s M/t"]] = None,
+        w_memory: Optional[f32[b"layers n_mem"]] = None,
+    ) -> Tuple:
+        """Returns (logits, kv_cache, stats), plus per-layer residual-stream
+        activations as a 4th element when `emit_activations` is set.
+
+        Those activations are what SPIRe's target-activation substitution feeds into
+        the draft: draft layer j consumes the target's layer-(j+6-1) output, mirroring
+        the pruned-init correspondence where draft layer j IS target layer j+6.
+        Emission is gated by a static flag and appends rather than replaces, so all
+        twelve existing call sites are unaffected and pay nothing.
+
+        Return type is a bare Tuple because the arity depends on that flag, which
+        @typechecked cannot express.
+
+        `memory` + `w_memory` are SPIRe's feedback-memory pathway: layer j adds
+        `sum_m w_memory[j, m] * memory[m]` into its residual stream before the
+        pre-attention norm. The bank is shared across layers (so it is closed over)
+        while the mixing weights are per-layer (so they ride the scan). During
+        training the bank holds the TARGET's activations -- the substitution the
+        paper prices at 0.393 tau; at inference it must hold the draft's own, since
+        no target is available. With w_memory all zeros this is an exact no-op,
+        which is how it should be initialized so it cannot regress a working draft."""
         ##### Initial embedding lookup.
         embed = shardops.all_gather("V/t M/d/s -> V/t M", jnp.bfloat16(self.embed))
         x = shardops.index_unreduced("[V/t] M, B/d L/s -> B/d L/s M", embed, ids, use_onehot=is_tpu())
@@ -237,9 +299,19 @@ class Model:
         @typechecked
         def loop_body(
             x: bf16[b"B/d L/s M/t"],
-            scanned_var: Tuple[TransformerLayer, Optional[bf16[b"2 B/d Klen K/t D"]], Optional[PRNGKey]],
-        ) -> Tuple[bf16[b"B/d L/s M/t"], Tuple[bf16[b"2 B/d Klen K/t D"], "StatsDict"]]:
-            layer_weights, kv_layer, layer_rng_key = scanned_var
+            # Bare Tuple: gains a per-layer w_memory row when the memory pathway is on.
+            scanned_var: Tuple,
+            # Bare Tuple: the per-layer output gains a third element (the residual
+            # stream) when emit_activations is set, which a fixed arity cannot express.
+        ) -> Tuple:
+            if use_memory:
+                layer_weights, kv_layer, layer_rng_key, w_row = scanned_var
+                # Feedback memory into the residual stream. f32 accumulation because
+                # w_row is f32 and the bank is bf16; cast back to keep the stream bf16.
+                mem_mix = jnp.einsum("m,mbld->bld", w_row, jnp.float32(memory))
+                x = x + jnp.bfloat16(mem_mix)
+            else:
+                layer_weights, kv_layer, layer_rng_key = scanned_var
 
             # Pre-attention RMSNorm
             gx = shardops.all_gather("B/d L/s M/t -> B/d L/s M", x)
@@ -317,10 +389,41 @@ class Model:
             )
             tensor_stats = jax.tree.map(lambda x: TensorStats.from_tensor(x), tensor_stats)
 
+            if emit_activations:
+                return x, (kv_layer, tensor_stats, x)
             return x, (kv_layer, tensor_stats)
 
-        scanned_vars = (self.transformer, kv_cache, layer_rngs)
-        x, (kv_cache, ts) = jax.lax.scan(loop_body, jnp.bfloat16(x), scanned_vars)
+        use_memory = memory is not None
+        if use_memory:
+            assert w_memory is not None, "memory requires w_memory"
+            assert w_memory.shape == (h.layers, memory.shape[0]), (
+                f"w_memory must be [layers={h.layers}, n_mem={memory.shape[0]}], got {w_memory.shape}"
+            )
+            # DEPTH-CAUSAL MASK. Slot m holds the state at depth m; draft layer j
+            # sits at depth j and may only read states strictly beneath it, i.e.
+            # m <= j. Without this the top slot carries the TARGET'S FINAL HIDDEN
+            # STATE, and since pruned init hands the draft a copy of the target's
+            # unembedding, the draft can route that state straight to the output and
+            # reproduce the target's distribution without learning anything. It does
+            # exactly that if allowed: an unmasked run put 0.38 and 0.13 of its
+            # weight on the final-layer slot and ~0.0004 everywhere else, drove
+            # training loss BELOW a correct run, and then scored tau = 1.000 with
+            # acceptance 0.000 at decode, where the leaked state is unavailable.
+            #
+            # Masked entries receive zero gradient and stay at their zero init, so
+            # a trained w_memory should show an all-zero upper triangle -- which is
+            # a cheap post-hoc check that the mask was actually in force.
+            depth = jnp.arange(h.layers)[:, None]
+            slot = jnp.arange(memory.shape[0])[None, :]
+            w_causal = jnp.where(slot <= depth, w_memory, 0.0)
+            scanned_vars = (self.transformer, kv_cache, layer_rngs, w_causal)
+        else:
+            scanned_vars = (self.transformer, kv_cache, layer_rngs)
+        if emit_activations:
+            x, (kv_cache, ts, layer_acts) = jax.lax.scan(loop_body, jnp.bfloat16(x), scanned_vars)
+        else:
+            x, (kv_cache, ts) = jax.lax.scan(loop_body, jnp.bfloat16(x), scanned_vars)
+            layer_acts = None
 
         ##### Final layernorm and output projection.
         x = shardops.all_gather("B/d L/s M/t -> B/d L/s M", x)
@@ -349,6 +452,8 @@ class Model:
             }
         )
 
+        if emit_activations:
+            return logits, kv_cache, tensor_stats, layer_acts
         return logits, kv_cache, tensor_stats
 
 
