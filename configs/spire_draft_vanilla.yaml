@@ -1,0 +1,63 @@
+# SPIRe reproduction: the vanilla speculative-decoding draft (1/8 the target's
+# body parameters), trained with ordinary next-token CE -- no distillation, no
+# sparse mask, no feedback memory. This is the weaker of the paper's two baselines.
+#
+#   python -m train --config-name=spire_draft_vanilla +model_name=spire_draft_vanilla
+#
+# Architecture from arXiv:2504.06419, cross-checked against the parameter counts
+# printed in spire_appendix.ipynb:
+#   body  = 4 * (2*d_model + 4*d_model*n_kv*d_head + 3*d_model*d_ff) = 8,390,656
+#           (= 1/8 of the target's 67,117,056, as the paper specifies)
+#   total = body + 2*vocab*d_model                                   = 34,146,304
+#   tokens = 20 * total (Chinchilla)                                 = 682,926,080
+#
+# The draft is trained on the SAME data as the target. It has no dependency on the
+# target's weights -- unlike the SPIRe draft, which is pruned from them and
+# distilled against them.
+#
+# Unspecified by the paper, our choices (see spire_target_1024.yaml for the fuller
+# discussion):
+#   batch_size 64  -- forced, not preferred: the [B, 1024, 50304] f32 logits are
+#                     206 MB/sequence regardless of d_model, so the draft hits the
+#                     same OOM cliff at 128 that the target does. Shrinking d_model
+#                     does not buy batch here; the vocabulary dominates.
+#   learning_rate  -- 3e-3, the value chosen empirically for the target. The probe
+#                     found the 1.5e-3..6.5e-3 band flat to within 2% with no
+#                     divergence, so this is carried over rather than re-probed.
+#                     Worth re-probing only if the loss curve looks wrong.
+defaults:
+  - base
+  - dataset/longcrawl
+  - _self_
+
+root_working_dir: '/home/ubuntu/runs'
+
+model:
+  vocab: 50304
+  seq_len: 1024
+  layers: 4
+  d_model: 256
+  n_q_per_kv: 1  # MHA: 8 query heads, 8 KV heads
+  n_kv: 8
+  d_head: 64
+  d_ff: 2048
+  rope_max_timescale: 10000
+
+optimizer:
+  batch_size: 64                # 64 * 1024 = 65,536 tokens/step
+  learning_rate: 3.0e-3
+  steps: 10421                  # 682,926,080 / 65,536
+  warmup_steps: 1042
+  steps_for_lr: 10421
+  cosine_learning_rate_final_fraction: 0.01
+  adam_atan2_a: null
+  adam_atan2_b: null
+
+mesh:
+  d: 1
+  t: 1
+  s: 1
+
+# eval_tokens must be an exact multiple of batch_size * seq_len; 50,331,648 is
+# 768 * 65,536, so it is valid at batch_size 64.
+checkpoint_interval: 2000
