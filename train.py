@@ -212,15 +212,33 @@ def loss_fn(
             Ml = h.d_model // shardops.axis_size("t")
             self_mem = jnp.zeros((h.layers, Bl, Ll, Ml), jnp.bfloat16)
             offs = jnp.arange(Ll) % kblk
-            hidden = None
-            for j in range(kblk):
+            # Each pass is REMATERIALISED rather than stored. The k passes are a
+            # Python loop, so without this the graph holds k independent copies
+            # of a full forward pass's activations until the backward pass runs;
+            # that is what remained after the unembedding fix took the request
+            # from 117GB to 77GB, still over an 80GB card. Under remat only the
+            # pass boundaries survive -- self_mem and the mixed memory, 134MB
+            # each -- and each pass is recomputed once during the backward.
+            #
+            # The trade is roughly one extra draft forward per pass. The draft is
+            # two layers against the frozen eight-layer teacher that every step
+            # runs anyway, so it is a small fraction of step time and it is what
+            # keeps the batch size at 64, matching every other model here.
+            @jax.checkpoint
+            def one_pass(self_mem, memory, model, inputs):
                 out = model.forward_pass(
                     h, inputs, causal_mask, rng, memory=memory,
                     w_memory=model.w_memory, memory_block_k=kblk,
                     self_memory=self_mem, emit_activations=True,
                     hidden_only=True,
                 )
-                hj, tensor_stats, acts_j, embed_j = out[0], out[2], out[3], out[4]
+                hj, ts, acts_j, embed_j = out[0], out[2], out[3], out[4]
+                states = jnp.concatenate([embed_j[jnp.newaxis], acts_j], axis=0)
+                return hj, Model.mix_memory(model.w_memory, states), ts
+
+            hidden = None
+            for j in range(kblk):
+                hj, m_j, tensor_stats = one_pass(self_mem, memory, model, inputs)
                 keep = (offs == j)
                 # Only offset-j positions are correct in pass j; every other
                 # offset either was written by an earlier pass or will be by a
@@ -235,8 +253,6 @@ def loss_fn(
                 # with no feedback memory at all, which is what makes the paper's
                 # "almost entirely mitigated" hold in practice.
                 hidden = hj if hidden is None else jnp.where(keep[None, :, None], hj, hidden)
-                states = jnp.concatenate([embed_j[jnp.newaxis], acts_j], axis=0)
-                m_j = Model.mix_memory(model.w_memory, states)
                 self_mem = jnp.where(keep[None, None, :, None], m_j, self_mem)
             logits = model.unembed_hidden(hidden)
         else:
