@@ -237,6 +237,18 @@ class Model:
         return jax.tree.map(lax.with_sharding_constraint, arrays, shardings)
 
     @typechecked
+    def unembed_hidden(self, nx):
+        """Project an already-normed final hidden state to logits.
+
+        Split out of forward_pass so a caller running several passes over one
+        sequence can select the positions each pass owns and pay for the
+        unembedding exactly once -- see the note at the call site.
+        """
+        unembed = shardops.all_gather("V/t M/d/s -> V/t M", jnp.bfloat16(self.unembed))
+        return shardops.einsum_unreduced(
+            "B/d L/s M, V/t M -> B/d L/s V/t", nx, unembed, preferred_element_type=jnp.float32
+        )
+
     @staticmethod
     def mix_memory(w_memory, states):
         """m^i_t = sum_l softmax(w_i)_l * x^l_t   (paper 3.3).
@@ -318,6 +330,7 @@ class Model:
         memory_mask: Optional[bool_[b"B/d L/s"]] = None,
         memory_block_k: Optional[int] = None,
         self_memory: Optional[bf16[b"layers B/d L/s M/t"]] = None,
+        hidden_only: bool = False,
     ) -> Tuple:
         """Returns (logits, kv_cache, stats), plus per-layer residual-stream
         activations as a 4th element when `emit_activations` is set.
@@ -764,10 +777,16 @@ class Model:
         x = shardops.all_gather("B/d L/s M/t -> B/d L/s M", x)
         ln_final = shardops.all_gather("M/t/d/s -> M", jnp.float32(self.ln_final))
         nx = jnp.bfloat16(rms_norm(x) * ln_final)
-        unembed = shardops.all_gather("V/t M/d/s -> V/t M", jnp.bfloat16(self.unembed))
-        logits = shardops.einsum_unreduced(
-            "B/d L/s M, V/t M -> B/d L/s V/t", nx, unembed, preferred_element_type=jnp.float32
-        )
+        if hidden_only:
+            # Return the normed hidden state and let the caller unembed. A caller
+            # running k passes over one sequence needs only L/k positions from
+            # each, and the logits tensor is by far the largest thing here --
+            # 13.2GB at B=64, L=1024, V=50304 in f32, against 67MB for the hidden
+            # state. Materialising it per pass is what put a 4-pass
+            # feedback-memory step 117GB over an 80GB card.
+            logits = nx
+        else:
+            logits = self.unembed_hidden(nx)
 
         tensor_stats = {
             f"{i}.{k}": TensorStats(
@@ -783,9 +802,10 @@ class Model:
             {
                 "out_x.act": TensorStats.from_tensor(x),
                 "out_x_normed.act": TensorStats.from_tensor(nx),
-                "out.logits": TensorStats.from_tensor(logits),
             }
         )
+        if not hidden_only:
+            tensor_stats["out.logits"] = TensorStats.from_tensor(logits)
 
         if emit_activations:
             # 5th element: the post-embedding state, slot 0 of the feedback-memory

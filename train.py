@@ -212,22 +212,33 @@ def loss_fn(
             Ml = h.d_model // shardops.axis_size("t")
             self_mem = jnp.zeros((h.layers, Bl, Ll, Ml), jnp.bfloat16)
             offs = jnp.arange(Ll) % kblk
-            logits = None
+            hidden = None
             for j in range(kblk):
                 out = model.forward_pass(
                     h, inputs, causal_mask, rng, memory=memory,
                     w_memory=model.w_memory, memory_block_k=kblk,
                     self_memory=self_mem, emit_activations=True,
+                    hidden_only=True,
                 )
-                lj, tensor_stats, acts_j, embed_j = out[0], out[2], out[3], out[4]
+                hj, tensor_stats, acts_j, embed_j = out[0], out[2], out[3], out[4]
                 keep = (offs == j)
                 # Only offset-j positions are correct in pass j; every other
                 # offset either was written by an earlier pass or will be by a
                 # later one, and gradients follow the same selection.
-                logits = lj if logits is None else jnp.where(keep[None, :, None], lj, logits)
+                #
+                # Accumulate the HIDDEN STATE, not logits. Each pass owns L/k
+                # positions, so unembedding all L of them k times computes k-1
+                # sequence-fulls of logits that are then thrown away -- 13.2GB
+                # apiece at this size, and all of them live until the backward
+                # pass. That is what OOMed at 117GB. Selecting first and
+                # unembedding once costs one logits tensor, the same as a model
+                # with no feedback memory at all, which is what makes the paper's
+                # "almost entirely mitigated" hold in practice.
+                hidden = hj if hidden is None else jnp.where(keep[None, :, None], hj, hidden)
                 states = jnp.concatenate([embed_j[jnp.newaxis], acts_j], axis=0)
                 m_j = Model.mix_memory(model.w_memory, states)
                 self_mem = jnp.where(keep[None, None, :, None], m_j, self_mem)
+            logits = model.unembed_hidden(hidden)
         else:
             logits, _, tensor_stats = model.forward_pass(
                 h, inputs, causal_mask, rng, memory=memory,
