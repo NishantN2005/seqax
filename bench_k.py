@@ -64,7 +64,8 @@ import shardlib.shardtypes as shardtypes
 
 shardtypes.register_with_typeguard()
 
-from bench import HOI_H100_PCIE, body_params, calculate_itm  # noqa: E402
+from bench import (HOI_H100_PCIE, body_params, calculate_itm,  # noqa: E402
+                   draft_kv_projection_params)
 from decode import load_weights, make_generate  # noqa: E402
 from model import ModelConfig  # noqa: E402
 from speculative import make_speculative_generate  # noqa: E402
@@ -89,8 +90,16 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--config", required=True)
     p.add_argument("--model-name", required=True)
-    p.add_argument("--draft-config", required=True)
-    p.add_argument("--draft-model-name", required=True)
+    p.add_argument("--mode", choices=["vanilla", "magicdec", "spire"], default="vanilla",
+                   help="which of the paper's three draft models to time")
+    p.add_argument("--draft-config", default=None,
+                   help="not used by magicdec, whose draft IS the target")
+    p.add_argument("--draft-model-name", default=None)
+    p.add_argument("--sink", type=int, default=1)
+    p.add_argument("--window", type=int, default=64,
+                   help="StreamingLLM window for magicdec/spire. The paper fixes it at 64 "
+                        "for training and tau, while the appendix cost model parameterizes "
+                        "it as L//8; at the L=512 this harness defaults to, those coincide.")
     p.add_argument("--taus", required=True, help="k:tau,... from the independent tau.py sweep")
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--context", type=int, default=512)
@@ -108,9 +117,40 @@ def main() -> None:
 
     cfg = OmegaConf.load(f"configs/{args.config}.yaml")
     h_t = ModelConfig(**cfg.model)
-    h_d = ModelConfig(**OmegaConf.load(f"configs/{args.draft_config}.yaml").model)
+
+    # Mode -> draft wiring. Identical to tau.py's, deliberately: if the two
+    # harnesses configured the draft differently, the tau cross-check at the end
+    # would be comparing two different computations and could not detect anything.
+    if args.mode == "magicdec":
+        # MagicDec's draft is the target model reading its cache through a
+        # StreamingLLM mask. No second checkpoint.
+        h_d = h_t
+        d_window, prefill_dense, mdrope = args.window, True, True
+    elif args.mode == "vanilla":
+        assert args.draft_config and args.draft_model_name, "vanilla needs a draft model"
+        h_d = ModelConfig(**OmegaConf.load(f"configs/{args.draft_config}.yaml").model)
+        d_window, prefill_dense, mdrope = None, True, False
+    else:  # spire: trained with the sparse mask, original-text RoPE positions
+        assert args.draft_config and args.draft_model_name, "spire needs a draft model"
+        h_d = ModelConfig(**OmegaConf.load(f"configs/{args.draft_config}.yaml").model)
+        d_window, prefill_dense, mdrope = args.window, False, False
     mc = cfg.mesh
     N_t, N_d = body_params(h_t), body_params(h_d)
+
+    # What the cost model predicts for THIS draft (spire_appendix.ipynb, cells
+    # 8-10). The three variants differ in exactly three places: how much of the
+    # cache the draft reads, whose weights it loads, and whether it pays to
+    # project a memory vector into a key and a value.
+    if args.mode == "vanilla":
+        kv_len_pred, N_pred, h_pred = L, N_d, h_d
+        kvp_pred = 0
+    elif args.mode == "magicdec":
+        kv_len_pred, N_pred, h_pred = args.sink + args.window, N_t, h_t
+        kvp_pred = 0
+    else:
+        kv_len_pred, N_pred, h_pred = args.sink + args.window, N_d, h_d
+        kvp_pred = draft_kv_projection_params(h_d)
+    sparse_draft = args.mode != "vanilla"
 
     # Rounds per depth are CALIBRATED, not assumed. The reference tau from tau.py
     # is only a starting guess: it is measured over 8 rounds, while this harness
@@ -134,7 +174,10 @@ def main() -> None:
     # generous bound; timing runs under the tight one.
 
     print(f"devices: {jax.devices()}")
-    print(f"B={B} L={L}  token budgets G1={G1} G2={G2}  HOI={args.hoi}")
+    print(f"mode={args.mode}  B={B} L={L}  token budgets G1={G1} G2={G2}  HOI={args.hoi}")
+    print(f"draft: window={d_window} sink={args.sink} prefill_dense={prefill_dense} "
+          f"magicdec_rope={mdrope}; cost model reads {kv_len_pred} cache entries "
+          f"({kv_len_pred}+k corrected)")
 
 
     rows = []
@@ -142,8 +185,12 @@ def main() -> None:
         rng0 = jnp.zeros((2,), jnp.uint32)
         with shardtypes.Scope():
             w_t, _ = load_weights(h_t, os.path.join(cfg.root_working_dir, args.model_name), rng0)
-        with shardtypes.Scope():
-            w_d, _ = load_weights(h_d, os.path.join(cfg.root_working_dir, args.draft_model_name), rng0)
+        if args.mode == "magicdec":
+            w_d = w_t          # the draft IS the target, restricted at decode
+        else:
+            with shardtypes.Scope():
+                w_d, _ = load_weights(
+                    h_d, os.path.join(cfg.root_working_dir, args.draft_model_name), rng0)
 
         # REAL contexts, from the same validation split tau.py draws from.
         #
@@ -165,7 +212,11 @@ def main() -> None:
         print(f"calibrating rounds from observed tau ({probe}-round probe, klen {probe_klen}):")
         for k in ks:
             with shardtypes.Scope():
-                sp = make_speculative_generate(h_t, h_d, L, probe, k, 0.0, klen=probe_klen)
+                sp = make_speculative_generate(
+                    h_t, h_d, L, probe, k, 0.0, klen=probe_klen,
+                    draft_sink=args.sink, draft_window=d_window,
+                    draft_prefill_dense=prefill_dense, magicdec_rope=mdrope,
+                    compact_draft_cache=True)
                 op = jax.block_until_ready(sp(w_t, w_d, prompt, rng))
             tau_c = float(np.mean(np.asarray(op[1]))) / probe
             calib[k] = tau_c
@@ -209,19 +260,28 @@ def main() -> None:
 
 
         print(f"\n{'k':>3} {'rounds':>11} {'tokens':>13} {'tau_obs':>8} {'tau_ref':>8} "
-              f"{'ms/tok':>8} {'speedup':>8} {'ITM_meas':>9} {'ITM_pred':>9} {'jit':>5}")
-        print("-" * 96)
+              f"{'ms/tok':>8} {'speedup':>8} {'ITM_meas':>9} {'ITM_pred':>9} {'ITM_pr+':>8} "
+              f"{'jit':>5}")
+        print("-" * 105)
         for k in ks:
             r1, r2 = rounds[k]
             try:
                 with shardtypes.Scope():
-                    s1 = make_speculative_generate(h_t, h_d, L, r1, k, 0.0, klen=klen)
+                    s1 = make_speculative_generate(
+                        h_t, h_d, L, r1, k, 0.0, klen=klen,
+                        draft_sink=args.sink, draft_window=d_window,
+                        draft_prefill_dense=prefill_dense, magicdec_rope=mdrope,
+                        compact_draft_cache=True)
                     o1 = jax.block_until_ready(s1(w_t, w_d, prompt, rng))
                     n1 = float(np.mean(np.asarray(o1[1])))
                     n1max = float(np.max(np.asarray(o1[1])))
                     ts1, js1 = timeit(lambda: s1(w_t, w_d, prompt, rng), args.reps)
                 with shardtypes.Scope():
-                    s2 = make_speculative_generate(h_t, h_d, L, r2, k, 0.0, klen=klen)
+                    s2 = make_speculative_generate(
+                        h_t, h_d, L, r2, k, 0.0, klen=klen,
+                        draft_sink=args.sink, draft_window=d_window,
+                        draft_prefill_dense=prefill_dense, magicdec_rope=mdrope,
+                        compact_draft_cache=True)
                     o2 = jax.block_until_ready(s2(w_t, w_d, prompt, rng))
                     n2 = float(np.mean(np.asarray(o2[1])))
                     n2max = float(np.max(np.asarray(o2[1])))
@@ -254,13 +314,20 @@ def main() -> None:
             speedup = tpt_plain / tpt_spec
             tau_obs = dtok / (r2 - r1)           # tokens per round, from THIS run
             itm_meas = tau_obs / speedup          # speedup = tau / ITM, by definition
-            itm_pred = calculate_itm(B, L, h_t, k, args.hoi, N_t, N_d, L, h_d)
+            itm_pred = calculate_itm(B, L, h_t, k, args.hoi, N_t, N_pred,
+                                     kv_len_pred, h_pred, kvp_pred)
+            # What the model predicts for the cache we actually read: a windowed
+            # draft needs sink + window + k, not sink + window (ledger 10.1).
+            itm_pred_c = calculate_itm(B, L, h_t, k, args.hoi, N_t, N_pred,
+                                       kv_len_pred + (k if sparse_draft else 0),
+                                       h_pred, kvp_pred)
             print(f"{k:>3} {f'{r1}/{r2}':>11} {f'{n1:.0f}/{n2:.0f}':>13} {tau_obs:>8.3f} "
                   f"{taus[k]:>8.3f} {tpt_spec * 1e3:>8.4f} {speedup:>8.3f} "
-                  f"{itm_meas:>9.3f} {itm_pred:>9.3f} {jit:>5.0%}")
+                  f"{itm_meas:>9.3f} {itm_pred:>9.3f} {itm_pred_c:>8.3f} {jit:>5.0%}")
             rows.append({"k": k, "rounds": [r1, r2], "tokens": [n1, n2], "tau_observed": tau_obs,
                          "tau_reference": taus[k], "tpt_spec_s": tpt_spec, "tpt_plain_s": tpt_plain,
                          "speedup": speedup, "itm_measured": itm_meas, "itm_predicted": itm_pred,
+                         "itm_predicted_corrected": itm_pred_c,
                          "jitter": jit, "klen": klen})
 
     ok = [r for r in rows if "speedup" in r]
@@ -291,7 +358,8 @@ def main() -> None:
 
     if args.out:
         with open(args.out, "w") as f:
-            json.dump({"B": B, "L": L, "G1": G1, "G2": G2, "klen": klen, "hoi": args.hoi,
+            json.dump({"mode": args.mode, "sink": args.sink, "window": args.window,
+                       "B": B, "L": L, "G1": G1, "G2": G2, "klen": klen, "hoi": args.hoi,
                        "tpt_plain_s": tpt_plain, "rows": rows}, f, indent=2)
         print(f"\nwrote {args.out}")
 

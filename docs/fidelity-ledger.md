@@ -567,3 +567,28 @@ Note this does NOT invalidate the k=1..7 ITM divergence already measured: `Klen`
 was pinned to one value across every depth, so it cannot produce a trend in k.
 It shifts the absolute ITM levels, and it matters for the three-way comparison
 that has not been run yet.
+
+### 10.4 SPIRe's memory-projection FLOPs are inert at every cell the paper plots
+
+The appendix charges SPIRe's draft one extra term beyond an ordinary forward pass:
+
+```python
+N_draft_kv_params = 2 * layers * n_kv * d_model * d_head
+FLOPs_draft += 2 * N_draft_kv_params * B   # memory vector -> a key and a value
+```
+
+It is correctly included, and it changes nothing the paper reports. At B=64,
+L=512 the SPIRe draft is memory-bound by **8.4×** — 2.03e10 against 2.42e9 — so
+`f = max(FLOPs, (N + KV)·HOI)` is decided by the cache and the weights, and the
+FLOPs term is invisible. Dropping it entirely leaves every ITM in Figures 1, 4, 5
+and 6 bit-identical. It becomes visible only in the compute-bound corner (B≥512
+with contexts of a few tens of tokens), which is outside the plotted region.
+
+Worth stating because of what it prices: this is the cost of the feedback-memory
+mechanism, the component Figure 5 already ranks 5th of 6 at +0.049 τ. So feedback
+memory is a component whose benefit is 1.5% and whose modelled cost is exactly
+zero across the paper's entire operating region.
+
+`tests/test_cost_model.py` asserts both halves — that the term is inert at the
+headline cell, and that it still bites when compute-bound, so the first assertion
+cannot pass by the term simply being absent.

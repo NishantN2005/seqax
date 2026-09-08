@@ -74,16 +74,32 @@ def body_params(h: ModelConfig) -> int:
     return h.layers * per_layer
 
 
-def calculate_itm(B, L, h_t, k, HOI, N_target, N_draft, kv_draft_len, h_d) -> float:
+def draft_kv_projection_params(h: ModelConfig) -> int:
+    """Weights that turn a memory vector into a key and a value, for SPIRe.
+
+    `N_draft_kv_params` in spire_appendix.ipynb. SPIRe's draft does not compute
+    keys and values from its own hidden states for committed positions -- it
+    projects the target's activations -- and the appendix charges this, and
+    nothing else, on top of an ordinary forward pass.
+    """
+    return 2 * h.layers * h.n_kv * h.d_model * h.d_head
+
+
+def calculate_itm(B, L, h_t, k, HOI, N_target, N_draft, kv_draft_len, h_d,
+                  draft_kv_params: int = 0) -> float:
     """The paper's cost model, transcribed from spire_appendix.ipynb.
 
     Counts ELEMENTS, not bytes; f = max is the roofline with perfect overlap
-    assumed. HOI converts an element count into FLOP-equivalent time."""
+    assumed. HOI converts an element count into FLOP-equivalent time.
+
+    `draft_kv_params` is SPIRe's memory-vector projection; 0 for vanilla and
+    MagicDec, which read keys and values straight from their own cache.
+    """
     f = max
     kv_target = B * L * kv_elements_per_token(h_t)
     kv_draft = B * kv_draft_len * kv_elements_per_token(h_d)
     FLOPs_target = 2 * N_target * B
-    FLOPs_draft = 2 * N_draft * B
+    FLOPs_draft = 2 * N_draft * B + 2 * draft_kv_params * B
     FLOPs_verify = FLOPs_target * (k + 1)
     speculate = k * f(FLOPs_draft, (N_draft + kv_draft) * HOI)
     verify = f(FLOPs_verify, (N_target + kv_target) * HOI)
