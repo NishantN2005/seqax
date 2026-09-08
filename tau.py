@@ -73,12 +73,25 @@ def load_weights(h: ModelConfig, model_dir: str) -> Model:
 
 
 def dataset_prompts(cfg, context_len: int, batch: int, num_batches: int):
-    """Yield [batch, context_len] prompts from the validation split."""
+    """Yield [batch, context_len] prompts from the validation split.
+
+    The loader reads whole dataset rows and splits each into
+    dataset_seqlen/context_len sequences, so it insists the batch be a whole
+    number of rows -- with dataset_seqlen=7680 that is a multiple of 30 at
+    L=256, 15 at L=512 and 8 at L=960. That constraint belongs to the data
+    layout, not to the experiment: the timing benchmarks need B=64 because the
+    cost model is stated at that batch size, and 64 is not a multiple of 15.
+    Load the next valid multiple up and slice back down.
+    """
     params = jax_extra.make_dataclass_from_dict(input_loader.FlatTokensParams, cfg.dataset)
-    bp = input_loader.TokenBatchParams(len=context_len, batch=batch)
+    assert params.dataset_seqlen % context_len == 0, (
+        f"context_len {context_len} must divide dataset_seqlen {params.dataset_seqlen}")
+    per_row = params.dataset_seqlen // context_len
+    load_batch = -(-batch // per_row) * per_row   # round up to a whole number of rows
+    bp = input_loader.TokenBatchParams(len=context_len, batch=load_batch)
     loader = input_loader.ShufflingLoader("validation", params, bp)
     for i in range(num_batches):
-        yield jnp.asarray(loader.load(i).targets, dtype=jnp.uint32)
+        yield jnp.asarray(loader.load(i).targets[:batch], dtype=jnp.uint32)
 
 
 def random_prompts(vocab: int, context_len: int, batch: int, num_batches: int, seed: int = 0):
@@ -107,6 +120,14 @@ def main():
     p.add_argument("--no-magicdec-rope", dest="mdrope", action="store_false")
     p.add_argument("--prompts", choices=["dataset", "random"], default="dataset")
     p.add_argument("--by-context", action="store_true", help="also report a per-context (conservative) CI")
+    p.add_argument("--gen-tokens", type=int, default=0,
+                   help="paper stopping rule: score only the rounds a context needs to emit "
+                        "this many tokens (paper section 4 uses G=64). 0 = score every round.")
+    p.add_argument("--save", default=None, help="write the raw [contexts, rounds] accept matrix here (.npz)")
+    p.add_argument("--full-draft-cache", action="store_true",
+                   help="keep the draft's KV cache at full length and rely on the mask. "
+                        "Produces identical tau (tests/test_ring_buffer.py proves it bitwise); "
+                        "use it only to check that equivalence, never for timing.")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
@@ -147,6 +168,7 @@ def main():
             h_t, h_d, args.context_len, args.rounds, args.k, args.temperature,
             draft_sink=args.sink, draft_window=window,
             draft_prefill_dense=prefill_dense, magicdec_rope=mdrope,
+            compact_draft_cache=not args.full_draft_cache,
         )
 
         src = (dataset_prompts(cfg, args.context_len, args.batch, args.num_batches)
@@ -162,17 +184,51 @@ def main():
             print(f"  batch {i}: tau = {float(np.mean(all_acc[-1])) + 1:.3f}")
 
         acc = np.concatenate(all_acc, axis=0)  # [contexts, rounds]
-        gen = acc + 1.0
-        tau = float(gen.mean())
-        ci = 1.96 * float(gen.std(ddof=1)) / np.sqrt(gen.size)
-        print(f"\ntau = {tau:.3f} +/- {ci:.3f}  (n = {gen.size} rounds, "
-              f"{acc.shape[0]} contexts x {acc.shape[1]} rounds)")
-        print(f"acceptance rate = {float(acc.mean()) / args.k:.3f}  "
-              f"(mean accepted {float(acc.mean()):.3f} of k={args.k})")
+        gen = acc + 1.0                        # tokens committed per round, in [1, k+1]
+
+        # Which rounds count. The paper generates a FIXED NUMBER OF TOKENS
+        # ("G = 64 tokens given n = 65536 contexts"), not a fixed number of
+        # rounds. Those differ: under a fixed round budget a high-tau method
+        # emits more tokens than a low-tau one, so the methods get averaged over
+        # different amounts of text. Scoring the rounds a context needs to reach
+        # G puts every method on the same generation length. The round that
+        # crosses G is counted in full -- it is a real round that really emitted
+        # those tokens, and dropping it would bias tau downward.
+        if args.gen_tokens > 0:
+            csum = np.cumsum(gen, axis=1)
+            counted = (csum - gen) < args.gen_tokens   # this round began below budget
+            reached = float((csum[:, -1] >= args.gen_tokens).mean())
+            print(f"G={args.gen_tokens}: {reached * 100:.2f}% of contexts reached the budget "
+                  f"within {gen.shape[1]} rounds; counted "
+                  f"{float(counted.sum(1).mean()):.1f} rounds/context on average")
+            assert reached >= 0.99, (
+                f"only {reached * 100:.1f}% of contexts emitted {args.gen_tokens} tokens in "
+                f"{gen.shape[1]} rounds -- raise --rounds, or the short contexts bias tau up")
+        else:
+            counted = np.ones_like(gen, dtype=bool)
+
+        sel = gen[counted]                     # 1-D: every scored round
+        tau = float(sel.mean())
+        ci = 1.96 * float(sel.std(ddof=1)) / np.sqrt(sel.size)
+        print(f"\ntau = {tau:.3f} +/- {ci:.3f}  (n = {sel.size} rounds, "
+              f"{gen.shape[0]} contexts x {gen.shape[1]} rounds)")
+        nacc = sel - 1.0
+        print(f"acceptance rate = {float(nacc.mean()) / args.k:.3f}  "
+              f"(mean accepted {float(nacc.mean()):.3f} of k={args.k})")
         if args.by_context:
-            per_ctx = gen.mean(axis=1)
+            # Rounds inside one context share a prefix, so they are not
+            # independent draws and the round-level CI above is optimistic.
+            # Treating each context as a single observation is the conservative read.
+            per_ctx = (gen * counted).sum(1) / counted.sum(1)
             ci_c = 1.96 * float(per_ctx.std(ddof=1)) / np.sqrt(per_ctx.size)
             print(f"per-context tau = {float(per_ctx.mean()):.3f} +/- {ci_c:.3f} (conservative)")
+        if args.save:
+            os.makedirs(os.path.dirname(os.path.abspath(args.save)), exist_ok=True)
+            np.savez_compressed(args.save, n_accepted=acc.astype(np.int16),
+                                mode=args.mode, k=args.k, context_len=args.context_len,
+                                temperature=args.temperature, window=(window if window else -1),
+                                sink=args.sink, gen_tokens=args.gen_tokens)
+            print(f"raw accept matrix -> {args.save}")
         if args.mode == "self":
             # In exact arithmetic self-drafting accepts every token, so tau == k+1.
             # Measured tau falls slightly short because the draft evaluates tokens

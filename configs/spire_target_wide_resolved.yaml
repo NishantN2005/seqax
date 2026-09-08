@@ -1,0 +1,54 @@
+root_working_dir: /home/ubuntu/runs
+clone_from: ''
+clone_checkpoint_index: 0
+reset_optimizer: false
+log_tensor_stats: false
+optimizer:
+  cosine_learning_rate_final_fraction: 0.01
+  adam_b1: 0.9
+  adam_b2: 0.95
+  adam_eps: 1.0e-08
+  adam_eps_root: 0.0
+  weight_decay: 0.1
+  adam_completed_steps_offset: 0
+  dataloader_steps_offset: 0
+  batch_size: 64
+  learning_rate: 0.003
+  steps: 36203
+  warmup_steps: 3620
+  steps_for_lr: 36203
+  adam_atan2_a: null
+  adam_atan2_b: null
+weight_init_seed: 0
+einsum_seed: 0
+mesh:
+  d: 1
+  t: 1
+  s: 1
+use_firestore: false
+firestore_gcp_project: ''
+zarr_log_flush_frequency: 100
+checkpoint_interval: 4000
+io:
+  max_io_threads: 64
+max_retries: 0
+dataset:
+  filespec: /home/ubuntu/data/lc64-flat-7680.zarr
+  streams: 1
+  read_blocks_per_shuffle_buffer: 1024
+  sequences_per_read_block: 256
+  seed: 1
+  dataset_seqlen: 7680
+  sequence_packing: true
+  eval_tokens: 50331648
+model:
+  vocab: 50304
+  seq_len: 1024
+  layers: 8
+  d_model: 512
+  n_q_per_kv: 1
+  n_kv: 8
+  d_head: 128
+  d_ff: 4096
+  rope_max_timescale: 10000
+model_name: spire_target_1024
