@@ -75,7 +75,7 @@ def _sample(logits: jax.Array, rng: jax.Array, step: jax.Array, temperature: flo
 
 
 def make_generate(h: ModelConfig, prompt_len: int, gen_len: int, temperature: float,
-                  sink_size: int = 0, window: int | None = None):
+                  sink_size: int = 0, window: int | None = None, klen: int | None = None):
     """Build a jitted, sharded generate function for fixed prompt/generation lengths.
 
     Returns generate(weights, prompt_ids[B, prompt_len], rng) -> generated_ids[B, gen_len].
@@ -95,7 +95,10 @@ def make_generate(h: ModelConfig, prompt_len: int, gen_len: int, temperature: fl
     """
     P, G = prompt_len, gen_len
     Pf = P + 1  # prefilled length, including the BOS sentinel at position 0
-    Klen = Pf + G  # fixed cache size; the last generated token is never written back
+    # klen overrides the cache size. Attention reads the whole allocated Klen, so a
+    # benchmark comparing configurations MUST hold it fixed or it is partly
+    # measuring buffer size. Default preserves the previous behaviour exactly.
+    Klen = klen if klen is not None else Pf + G
     if window is None:
         window = Klen  # window covers everything reachable -> exactly dense
 

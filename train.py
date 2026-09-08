@@ -137,6 +137,7 @@ def loss_fn(
     # positions being drafted do not exist. Asserting here instead crashed a
     # completed 20,841-step run during its final eval pass.
     memory = None
+    memory_mask = None
     if h.n_mem > 0 and t_acts is not None:
         first = h_teacher.layers - h.layers
         lo = first - 1
@@ -145,32 +146,95 @@ def loss_fn(
         )
         memory = t_acts[lo : lo + h.n_mem]
 
-        # ---- Rollout split: train the draft under the DEPLOYMENT memory condition ----
-        # At decode the draft only ever has target activations for prompt positions:
-        # its cache over the prompt is built during prefill, where both models
-        # consume the same committed tokens. Every position it *generates* is
-        # produced with no memory at all -- the target has not seen those tokens,
-        # and the newly committed token is one the target produced rather than
-        # consumed, so even the first draft step has nothing.
+        # ---- Rollout: train under the DEPLOYMENT memory condition ----
+        # At decode the draft has target activations only for positions the target
+        # has actually processed. For the k tokens it is speculating there are
+        # none, and it must fall back on its OWN residual states -- which is what
+        # feedback memory is for, and what model.forward_pass now does when a
+        # position is unmasked.
         #
-        # Training with memory everywhere therefore teaches the draft to rely on a
-        # signal that is absent exactly when it matters. Two runs confirmed this the
-        # hard way: the draft learns a 0.418-weighted memory term, then scores
-        # eval loss 12.88 and tau ~= 1.00 without it -- unusable, not merely worse.
+        # So the split is not "memory vs zeros" (an earlier version of this, which
+        # produced a draft that trained to loss 0.75 and scored tau 1.000 at
+        # decode). It is "target states vs the draft's own states", exactly the
+        # boundary `t <= S-k` describes. Positions before the split get the
+        # substitution; positions after it get self-memory, the deployment path.
         #
-        # So we zero the memory past a split point, mimicking the prompt/generation
-        # boundary. The split is resampled each step so the draft is never tuned to
-        # one prompt length. This is our reading of `t <= S-k` and `train_rollout_k`;
-        # the paper pins neither the split nor the decode-time source (ledger 3.7).
-        if rng is not None:
-            split = jax.random.randint(fold_in_str(rng, "rollout_split"), (), L // 4, L + 1)
-            keep = (jnp.arange(L) < split)[jnp.newaxis, jnp.newaxis, :, jnp.newaxis]
-            memory = memory * keep.astype(memory.dtype)
+        # The split is resampled every step so the draft is never tuned to one
+        # prompt length, and it is biased toward SHORT prefixes: tau is determined
+        # entirely by self-memory positions, so those are what need the training
+        # signal. A uniform split over [L/4, L] left only ~37% of positions in that
+        # regime and the resulting draft underperformed the no-memory baseline.
+        if h.memory_mode == "kv":
+            # Paper 3.3 / Figure 2: "we perform k forward passes on every k-th
+            # prefix of a sequence". Every k-th prefix S is its own training
+            # example -- positions t <= S-k read the TARGET's activations, the
+            # last k read the draft's own. So whether a key is target-sourced
+            # depends on the query's block, which a per-position memory_mask
+            # cannot express; forward_pass builds the (query, key) masks from
+            # memory_block_k instead.
+            #
+            # This replaces the prefix-split rollout used by the additive
+            # pathway. That split marked ONE boundary per sequence, leaving up to
+            # L - split positions running on self-memory when decode only ever has
+            # k of them in flight -- a far harsher regime than deployment, and one
+            # the paper does not describe.
+            assert h.memory_block_k > 0, (
+                "memory_mode='kv' needs memory_block_k set to the speculation depth k")
+            memory_mask = None
+        elif rng is not None:
+            split = jax.random.randint(fold_in_str(rng, "rollout_split"), (), 1, L // 4 + 1)
+            memory_mask = (jnp.arange(L) < split)[jnp.newaxis, :]
+            memory_mask = jnp.broadcast_to(memory_mask, (inputs.shape[0], L))
+        else:
+            memory_mask = None
 
     with shardtypes.Scope():
-        logits, _, tensor_stats = model.forward_pass(
-            h, inputs, causal_mask, rng, memory=memory, w_memory=(model.w_memory if h.n_mem > 0 else None)
-        )
+        if h.feedback_memory and memory is not None:
+            # ---- Feedback Transformer training (paper 3.3, Figure 2) ----
+            # "we perform k forward passes on every k-th prefix of a sequence, in
+            # a process similar to batched autoregressive decoding with teacher
+            # forcing." Pass j produces the positions at offset j within every
+            # block at once; it reads the feedback memory that passes 0..j-1 built
+            # for the offsets before it, and target activations for everything
+            # before the block start.
+            #
+            # The recurrence is what "inhibits parallelism over the context
+            # length". It is bounded at k passes rather than L because only the k
+            # in-flight positions are self-referential -- everything earlier is a
+            # target activation, which is the substitution that makes this
+            # affordable at all.
+            assert h.memory_block_k > 0, "feedback memory needs memory_block_k"
+            assert h.n_mem == h.layers + 1, (
+                f"feedback memory mixes over layers+1={h.layers + 1} states "
+                f"(embedding plus each layer output), so n_mem must be that, not {h.n_mem}")
+            kblk = h.memory_block_k
+            Bl, Ll = inputs.shape
+            Ml = h.d_model // shardops.axis_size("t")
+            self_mem = jnp.zeros((h.layers, Bl, Ll, Ml), jnp.bfloat16)
+            offs = jnp.arange(Ll) % kblk
+            logits = None
+            for j in range(kblk):
+                out = model.forward_pass(
+                    h, inputs, causal_mask, rng, memory=memory,
+                    w_memory=model.w_memory, memory_block_k=kblk,
+                    self_memory=self_mem, emit_activations=True,
+                )
+                lj, tensor_stats, acts_j, embed_j = out[0], out[2], out[3], out[4]
+                keep = (offs == j)
+                # Only offset-j positions are correct in pass j; every other
+                # offset either was written by an earlier pass or will be by a
+                # later one, and gradients follow the same selection.
+                logits = lj if logits is None else jnp.where(keep[None, :, None], lj, logits)
+                states = jnp.concatenate([embed_j[jnp.newaxis], acts_j], axis=0)
+                m_j = Model.mix_memory(model.w_memory, states)
+                self_mem = jnp.where(keep[None, None, :, None], m_j, self_mem)
+        else:
+            logits, _, tensor_stats = model.forward_pass(
+                h, inputs, causal_mask, rng, memory=memory,
+                w_memory=(model.w_memory if h.n_mem > 0 else None),
+                memory_mask=(memory_mask if h.n_mem > 0 else None),
+                memory_block_k=(h.memory_block_k if h.memory_mode == "kv" else None),
+            )
     max_logits: f32[b"B/d L/s 1"] = lax.pmax(jnp.max(lax.stop_gradient(logits), axis=-1, keepdims=True), "t")
     logits = logits - max_logits
     sum_logits = lax.psum(jnp.sum(jnp.exp(logits), axis=-1, keepdims=True), "t")

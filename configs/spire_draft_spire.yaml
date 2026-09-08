@@ -1,13 +1,19 @@
 # SPIRe reproduction: the SPIRe draft itself (1/4 the target's body params).
 #
-# PHASE A: pruned init + sparse-mask training + MixedLoss with distillation.
-# Feedback memory is NOT included. That is deliberate -- Figure 5 prices feedback
-# memory at 0.049 tau (3.401 full vs 3.352 without), which is barely above our
-# run-to-run measurement jitter of ~0.03, while distillation (0.332) and pruned
-# init (0.296) are worth an order of magnitude more and are fully specified.
+# THIS IS NOT SPIRe. It is the Figure 5 ablation "without feedback memory and
+# without attending to target activations", and its published value is
 #
-# So this config targets a PUBLISHED number, not an interpolation:
-#     spire_no_feedback_memory = 3.352 at L=512
+#     tau = 2.959 at L=512        (spire_appendix.ipynb cell 21)
+#
+# not the 3.401 of Table 1. It has the sparse KV cache, pruned init and MixedLoss
+# distillation, and NEITHER memory component. An earlier version of this header
+# claimed it targeted 3.352; that was wrong, because 3.352 is the arm that still
+# attends to target activations and this one does not.
+#
+# Kept because it is trained, measured (2.851, -3.6% against 2.959, in line with
+# our -3.1% on vanilla and -3.3% on MagicDec), and is a published reference point
+# we can report. It is NOT used for any throughput, ITM or cost measurement --
+# spire_draft_spire_full is the SPIRe model. See that config.
 #
 #   1. PYTHONPATH=. python tools/prune_init.py \
 #        --target-config spire_target_1024 --target-name spire_target_1024 \

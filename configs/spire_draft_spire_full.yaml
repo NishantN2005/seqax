@@ -1,0 +1,130 @@
+# SPIRe reproduction: FULL SPIRe -- memory pathway AND feedback memory.
+#
+# What changed from spire_draft_spire, and why there are two configs.
+#
+# spire_draft_spire has the sparse KV cache, pruned init and MixedLoss
+# distillation, and no memory pathway at all. Read against MatX's own appendix
+# notebook (cell 21), that is not SPIRe -- it is exactly the Figure 5 ablation
+# "without feedback memory and without attending to target activations", whose
+# published value is tau = 2.959 rather than the 3.401 of Table 1. We measured
+# 2.851 for it, -3.6%, in line with our -3.1% on vanilla and -3.3% on MagicDec.
+# It is kept as a faithful reproduction of that ablation.
+#
+# This config adds the technique Figure 5 ranks SECOND of six in importance:
+# attending to target model activations. From the notebook's literals,
+#     2.959  without feedback memory and without target activations   <- spire_draft_spire
+#     3.352  without feedback memory                                  <- not trained, see below
+#     3.401  full SPIRe (adds feedback memory)                        <- THIS config
+#
+# There is deliberately no intermediate config. The 3.352 arm would only be a
+# diagnostic -- something to consult if this model missed 3.401 and we needed to
+# know which of the two memory components was at fault -- and we already hold one
+# lower rung (spire_draft_spire, measured 2.851 against a published 2.959). Paying
+# for a diagnostic before there is anything to diagnose buys nothing, and a shelf
+# of half-SPIRes makes every downstream table ask which one it used. Every
+# measurement from here uses exactly three models: vanilla, MagicDec, and this.
+# so the pathway below is worth +0.393 tau and feedback memory a further +0.049.
+#
+# The operator (paper 3.3): the memory vectors REPLACE the keys and values, read
+# from previous positions -- z^i_t = Attention(x^i_t, m_<t) -- and for every
+# position the target has processed, m^i_t = y^{i+first-1}_t, a direct
+# substitution of the activation that the corresponding target layer consumed as
+# its input. Pruned init makes draft layer i literally target layer first+i, so
+# this hands those layers back the context they lost when they were torn out of
+# the stack. It is only dimensionally possible because the draft keeps the
+# target's full width and drops only depth.
+#
+# This config is the full model: every one of the six techniques Figure 5
+# ablates is now present.
+#
+#   1. PYTHONPATH=. python tools/prune_init.py \
+#        --target-config spire_target_1024 --target-name spire_target_1024 \
+#        --draft-config spire_draft_spire_full --draft-name spire_draft_spire_full
+#   2. python -m train --config-name=spire_draft_spire_full +model_name=spire_draft_spire_full
+#
+# Architecture from arXiv:2504.06419 / spire_appendix.ipynb cell 4:
+#   body  = 2 * (2*d_model + 4*d_model*n_kv*d_head + 3*d_model*d_ff) = 16,779,264
+#   total = body + 2*vocab*d_model                                   = 68,290,560
+#   tokens = 20 * total                                              = 1,365,811,200
+defaults:
+  - base
+  - dataset/longcrawl
+  - _self_
+
+root_working_dir: '/home/ubuntu/runs'
+
+model:
+  vocab: 50304
+  seq_len: 1024
+  layers: 2
+  d_model: 512
+  n_q_per_kv: 1
+  n_kv: 8
+  d_head: 128
+  d_ff: 4096
+  rope_max_timescale: 10000
+
+  # Sparse attention during TRAINING as well as inference -- this is what
+  # separates SPIRe's draft from MagicDec's restrict-at-decode baseline.
+  #
+  # Window 64, sink 1, FIXED for every context length. Paper 4 states this
+  # outright for both MagicDec and SPIRe, and 3.1 gives the reason: the mask
+  # exists so "the size of the KV cache is constant with respect to the decoding
+  # sequence length". The L/8 rule in the appendix is the COST MODEL's
+  # parameterization of the same window, anchored so that L=512 gives 64; it is
+  # not a second architecture. An earlier config here scaled the training window
+  # with L, which was our reconstruction rather than the paper's text.
+  attention_mask: streaming_llm
+  sink_size: 1
+  window: 64
+
+  # --- the memory pathway ---
+  # One slot per draft layer: slot i carries the target activation that draft
+  # layer i consumes. With an 8-layer target and a 2-layer draft that is target
+  # layers 5 and 6 (0-indexed outputs), i.e. the paper's m^1 = y^6, m^2 = y^7.
+  # layers+1, not layers: the feedback mix runs over the embedding state plus
+  # each layer output. The target-activation substitution still reads only slots
+  # 0..layers-1, so the target's FINAL hidden state (slot 2) is never indexed --
+  # which is what stops the draft routing it through its inherited unembedding,
+  # the leak that once produced training loss 0.75 and tau 1.000 at decode.
+  n_mem: 3
+  memory_mode: kv
+  # Training block size = the speculation depth. For every k-th prefix S,
+  # positions t <= S-k read target activations and the last k read the draft's
+  # own, so the source of a key depends on the query's block (Figure 2).
+  memory_block_k: 4
+
+  # Feedback memory: the k in-flight positions read
+  #     m^i_t = sum_l softmax(w_il) * x^l_t
+  # over ALL of the draft's layer states at t, rather than falling back on
+  # ordinary self-attention. Because the mix includes the FINAL layer's output,
+  # m_t cannot be read while position t is still being computed -- so attention
+  # is over m_<t strictly, and training needs k sequential forward passes. That
+  # is the cost the paper calls "significantly more expensive to train", and it
+  # is bounded at k rather than L only because everything before the block start
+  # is a target activation.
+  feedback_memory: true
+
+optimizer:
+  batch_size: 64                # 64 * 1024 = 65,536 tokens/step
+  learning_rate: 3.0e-3
+  steps: 20841                  # 1,365,811,200 / 65,536
+  warmup_steps: 2084
+  steps_for_lr: 20841
+  cosine_learning_rate_final_fraction: 0.01
+  adam_atan2_a: null
+  adam_atan2_b: null
+
+# MixedLoss(w) = w * distillation_CE + (1-w) * (-alpha), w=0.5.
+distill:
+  enabled: true
+  teacher_config: spire_target_1024
+  teacher_name: spire_target_1024
+  omega: 0.5
+
+mesh:
+  d: 1
+  t: 1
+  s: 1
+
+checkpoint_interval: 4000

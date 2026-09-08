@@ -79,6 +79,28 @@ class ModelConfig:
     # pathway and makes w_memory a zero-element array, so models that do not use
     # it (target, vanilla draft) carry no extra parameters or storage.
     n_mem: int = 0
+    # How the memory vectors enter the model.
+    #   "additive": memory is summed into the residual stream at the SAME position.
+    #   "kv":       memory REPLACES the keys and values, which is the operator
+    #               paper 3.3 actually specifies: z^i_t = Attention(x^i_t, m_<t).
+    # "additive" is kept only so existing checkpoints still load; it is not a
+    # configuration any paper describes. New SPIRe configs use "kv".
+    memory_mode: str = "additive"
+    # Training-time block size for the "kv" pathway (paper 3.3 / Figure 2). For a
+    # prefix S, positions t <= S-k read TARGET activations and the last k read the
+    # draft's own, so with prefixes every k-th position the source of a key
+    # depends on which block the QUERY sits in. 0 disables the split, which is the
+    # decode-time condition (one source per position, chosen by memory_mask).
+    memory_block_k: int = 0
+    # Feedback memory (paper 3.3, Fan et al. 2021). With this off, the k positions
+    # in flight fall back to ordinary self-attention, which is the Figure 5 arm
+    # "without feedback memory" (tau 3.352). With it on they instead read
+    #     m^i_t = sum_l softmax(w_i)_l * x^l_t
+    # a mix over ALL of the draft's layer states at t, layer 0 being the
+    # embedding. Because that includes the FINAL layer's output, m_t cannot be
+    # read while position t is still being computed -- hence attention over
+    # m_<t strictly, and hence k sequential forward passes during training.
+    feedback_memory: bool = False
 
 
 def streaming_visibility(q_pos: jax.Array, k_pos: jax.Array, sink_size: int, window: int) -> jax.Array:
@@ -215,6 +237,69 @@ class Model:
         return jax.tree.map(lax.with_sharding_constraint, arrays, shardings)
 
     @typechecked
+    @staticmethod
+    def mix_memory(w_memory, states):
+        """m^i_t = sum_l softmax(w_i)_l * x^l_t   (paper 3.3).
+
+        states: [layers+1, B, L, M] -- slot 0 the post-embedding state, slot l the
+        output of layer l-1. w_memory: [layers, layers+1], one softmax row per
+        draft layer; the paper writes it as exp(w_il) normalized over l, which is
+        a softmax. Returns [layers, B, L, M].
+
+        Unlike Fan et al. the paper shares neither the key/value projections nor
+        the memory vectors across layers, which is why the weights are a matrix
+        rather than a vector.
+        """
+        wts = jax.nn.softmax(jnp.float32(w_memory), axis=-1)      # [layers, layers+1]
+        return jnp.bfloat16(jnp.einsum("il,lbtm->ibtm", wts, jnp.float32(states)))
+
+    def memory_to_kv(self, h: ModelConfig, memory):
+        """Project memory vectors into this model's keys and values.
+
+        SPIRe's draft reads keys and values from memory vectors rather than from
+        its own hidden states (paper 3.3), and for every position the TARGET has
+        already processed, that memory IS a target activation. Two consequences,
+        both of which this method exists to express:
+
+        1. The draft never runs a forward pass over the prompt. Its cache over any
+           committed prefix is a pure projection of activations the target
+           computed during prefill and verification.
+        2. After each verification round the committed positions' cache entries
+           must be REWRITTEN from the target's activations. Skipping that leaves
+           self-sourced entries in the cache, and with a 64-token window every
+           position the draft can still see is a generated one -- so after ~64
+           tokens the entire visible cache would be the wrong source.
+
+        The appendix prices exactly this and nothing else as SPIRe's extra draft
+        cost: `FLOPs_draft += 2 * N_draft_kv_params * B`, "FLOPs to project 1
+        memory vector into a key and a value for the next iteration".
+
+        memory: [n_mem, B/d, L/s, M/t]; slot j feeds draft layer j.
+        Returns [layers, 2, B/d, L, K/t, D], laid out like `kv_cache`.
+        """
+        assert h.memory_mode == "kv", "memory_to_kv is the kv pathway's projection"
+        assert memory.shape[0] >= h.layers, (
+            f"need one memory slot per layer: got {memory.shape[0]} for {h.layers} layers")
+
+        @typechecked
+        def body(_, scanned: Tuple):
+            layer_weights, mem_j = scanned
+            gm = shardops.all_gather("B/d L/s M/t -> B/d L/s M", mem_j)
+            ln_attn_in = shardops.all_gather("M/t/d/s -> M", jnp.float32(layer_weights.ln_attn_in))
+            nkv = jnp.bfloat16(rms_norm(gm) * ln_attn_in)
+            w_k = shardops.all_gather("M/d/s K/t D -> M K/t D", jnp.bfloat16(layer_weights.w_k))
+            w_v = shardops.all_gather("M/d/s K/t D -> M K/t D", jnp.bfloat16(layer_weights.w_v))
+            k = shardops.einsum_unreduced("B/d L/s M, M K/t D -> B/d L/s K/t D", nkv, w_k)
+            v = shardops.einsum_unreduced("B/d L/s M, M K/t D -> B/d L/s K/t D", nkv, w_v)
+            ln_k = shardops.all_gather("K/t D/d/s -> K/t D", jnp.float32(layer_weights.ln_k))
+            k = jnp.bfloat16(rms_norm(k) * ln_k)
+            k = shardops.all_gather("B/d L/s K/t D -> B/d L K/t D", k)
+            v = shardops.all_gather("B/d L/s K/t D -> B/d L K/t D", v)
+            return None, jnp.stack([k, v], axis=0)
+
+        _, kv = jax.lax.scan(body, None, (self.transformer, memory[: h.layers]))
+        return kv
+
     def forward_pass(
         self,
         h: ModelConfig,
@@ -223,11 +308,16 @@ class Model:
         rng: Optional[PRNGKey] = None,
         kv_cache: Optional[bf16[b"layers 2 B/d Klen K/t D"]] = None,
         kv_offset: Optional[i32[b"B/d"]] = None,
+        kv_write_index: Optional[i32[b"B/d"]] = None,
         rope_q_positions: Optional[i32[b"B/d L/s"]] = None,  # explicit RoPE positions for queries
         rope_k_positions: Optional[i32[b"B/d Klen"]] = None,  # explicit RoPE positions for cache keys
+        rope_table_len: Optional[int] = None,
         emit_activations: bool = False,
         memory: Optional[bf16[b"n_mem B/d L/s M/t"]] = None,
         w_memory: Optional[f32[b"layers n_mem"]] = None,
+        memory_mask: Optional[bool_[b"B/d L/s"]] = None,
+        memory_block_k: Optional[int] = None,
+        self_memory: Optional[bf16[b"layers B/d L/s M/t"]] = None,
     ) -> Tuple:
         """Returns (logits, kv_cache, stats), plus per-layer residual-stream
         activations as a 4th element when `emit_activations` is set.
@@ -257,8 +347,21 @@ class Model:
         x = jnp.bfloat16(rms_norm(x) * ln_embed)
         x = shardops.psum_scatter("B/d L/s M -> B/d L/s M/t", x)
 
+        # A ring slot's contents are unrelated to its index, so a multi-token
+        # write would have to wrap; every ring write in this codebase is a single
+        # decode step, and the multi-token writes (prefill, post-verification
+        # refresh) are scattered explicitly by the caller.
+        assert kv_write_index is None or ids.shape[1] == 1, (
+            f"kv_write_index is for single-token ring writes, got L={ids.shape[1]}")
         Klen = attention_mask.shape[2]
-        rope_table = RopeTable.create(Klen, h)
+        # The RoPE table is indexed by POSITION, which a compact sliding-window
+        # cache decouples from cache size: a 65-slot ring still carries absolute
+        # positions in the thousands. Sizing the table by Klen would silently
+        # clamp every position past the end of the cache -- not an error, just
+        # wrong rotations, and only for the long contexts the method exists to
+        # serve. Callers holding positions beyond their cache pass the bound.
+        rope_table = RopeTable.create(
+            Klen if rope_table_len is None else rope_table_len, h)
 
         layer_rngs = jax.random.split(fold_in_str(rng, "layer"), h.layers) if rng is not None else None
 
@@ -294,22 +397,134 @@ class Model:
             # spec = "B/d L/s Klen Q K/t, B/d Klen K/t D -> B/d L/s Q K/t D"
             return jnp.einsum("b q k Q K, b k K D -> b q Q K D", jnp.bfloat16(probs), v)
 
+        @typechecked
+        def two_source_attention(
+            q: bf16[b"B/d L/s Q K/t D"],
+            k1: bf16[b"B/d Klen K/t D"],
+            v1: bf16[b"B/d Klen K/t D"],
+            m1: bool_[b"B/d L/s Klen"],
+            k2: bf16[b"B/d Klen K/t D"],
+            v2: bf16[b"B/d Klen K/t D"],
+            m2: bool_[b"B/d L/s Klen"],
+        ) -> bf16[b"B/d L/s Q K/t D"]:
+            """Attention over two key/value sources under one softmax.
+
+            SPIRe's draft reads TARGET activations for positions the target has
+            processed and its OWN states for the k tokens in flight (paper 3.3).
+            During training every k-th prefix is a separate example, so whether a
+            key is target-sourced depends on the QUERY's block -- which no single
+            key/value tensor can represent. Two tensors with complementary masks
+            can, provided they share one softmax denominator.
+
+            m1 and m2 must be disjoint; their union is the ordinary attention
+            mask. When k1 == k2 and v1 == v2 this returns exactly what
+            dense_attention returns for that union, which is how it is tested.
+            """
+            if rope_q_positions is not None:
+                q = jnp.bfloat16(rope_table.apply_positions(q, rope_q_positions))
+            elif kv_offset is None:
+                q = jnp.bfloat16(rope_table.apply("L D -> 1 L 1 1 D", q, None))
+            else:
+                q_positions = kv_offset[:, jnp.newaxis] + jnp.arange(q.shape[1])[jnp.newaxis, :]
+                q = jnp.bfloat16(rope_table.apply_positions(q, q_positions))
+            def rot(kk):
+                if rope_k_positions is not None:
+                    return jnp.bfloat16(rope_table.apply_rows(kk, rope_k_positions))
+                return jnp.bfloat16(rope_table.apply("L D -> 1 L 1 D", kk, None))
+            k1, k2 = rot(k1), rot(k2)
+            lg1 = jnp.einsum("b q Q K D, b k K D -> b q k Q K", q, k1, preferred_element_type=jnp.float32)
+            lg2 = jnp.einsum("b q Q K D, b k K D -> b q k Q K", q, k2, preferred_element_type=jnp.float32)
+            lg1 = jnp.where(m1[:, :, :, jnp.newaxis, jnp.newaxis], lg1, -jnp.inf)
+            lg2 = jnp.where(m2[:, :, :, jnp.newaxis, jnp.newaxis], lg2, -jnp.inf)
+            # One denominator over both sources: take the joint max, then exponentiate.
+            mx = jnp.maximum(jnp.max(lg1, axis=2, keepdims=True), jnp.max(lg2, axis=2, keepdims=True))
+            mx = jnp.where(jnp.isfinite(mx), mx, 0.0)   # a row masked everywhere
+            e1 = jnp.exp(lg1 - mx)
+            e2 = jnp.exp(lg2 - mx)
+            denom = jnp.sum(e1, axis=2, keepdims=True) + jnp.sum(e2, axis=2, keepdims=True)
+            p1 = jnp.nan_to_num(e1 / denom, 0)
+            p2 = jnp.nan_to_num(e2 / denom, 0)
+            out1 = jnp.einsum("b q k Q K, b k K D -> b q Q K D", jnp.bfloat16(p1), v1)
+            out2 = jnp.einsum("b q k Q K, b k K D -> b q Q K D", jnp.bfloat16(p2), v2)
+            return jnp.bfloat16(out1 + out2)
+
         ##### Transformer blocks.
         @explicit_activation_checkpointing
         @typechecked
         def loop_body(
-            x: bf16[b"B/d L/s M/t"],
+            x_carry,
             # Bare Tuple: gains a per-layer w_memory row when the memory pathway is on.
             scanned_var: Tuple,
             # Bare Tuple: the per-layer output gains a third element (the residual
             # stream) when emit_activations is set, which a fixed arity cannot express.
         ) -> Tuple:
+            if use_bank:
+                x, bank = x_carry
+            else:
+                x = x_carry
+            kv_src = None    # None => keys and values come from x, as usual
             if use_memory:
-                layer_weights, kv_layer, layer_rng_key, w_row = scanned_var
-                # Feedback memory into the residual stream. f32 accumulation because
-                # w_row is f32 and the bank is bf16; cast back to keep the stream bf16.
-                mem_mix = jnp.einsum("m,mbld->bld", w_row, jnp.float32(memory))
-                x = x + jnp.bfloat16(mem_mix)
+                layer_weights, kv_layer, layer_rng_key, w_row, slot_idx = scanned_var
+                # Feedback memory into the residual stream. The bank holds the
+                # n_layer+1 residual states: slot 0 is the post-embedding state and
+                # slot m is layer m-1's output, so slot j is exactly what layer j
+                # consumes. The depth-causal weights (built below) zero every slot
+                # above j, so a layer can only read states beneath it.
+                #
+                # SOURCE of the bank differs by phase, and that is the whole
+                # mechanism. Training substitutes the TARGET's corresponding states
+                # (draft layer j is target layer j+first, so its input is target
+                # layer j+first-1's output). Inference has no target for the tokens
+                # being drafted, so the draft feeds back its OWN states -- which is
+                # what makes it "feedback" memory rather than a target side-channel.
+                # The bank always accumulates the draft's OWN states. Where the
+                # substitution applies we read the TARGET's instead. Blending at
+                # read time (rather than at write) keeps the self-accumulation
+                # intact, which is what the unmasked positions must consume.
+                #
+                # memory_mask is the rollout: True where the target has genuinely
+                # processed that position, False for the k in-flight positions the
+                # draft must handle on its own. Training under the same split the
+                # decoder will face is what `train_rollout_k` is for -- without it
+                # the draft leans on a signal that vanishes at deployment.
+                if kv_memory:
+                    # ---- SPIRe 3.3, the operator as written ----
+                    # m^i_t = y_t^{i+first-1} wherever the TARGET has processed
+                    # position t. The caller has already sliced `memory` so that
+                    # slot i is exactly what draft layer i needs, so this is a
+                    # DIRECT substitution of one activation -- not a weighted mix
+                    # over slots. The mix is the draft's own feedback memory, and
+                    # it applies only to the k positions the draft is speculating,
+                    # where no target activation exists.
+                    #
+                    # These vectors then replace the KEYS AND VALUES below. That
+                    # is the whole difference from the additive pathway, which
+                    # summed a memory vector into the residual stream at the same
+                    # position and is not an operator any paper describes.
+                    if mem_arr is not None:
+                        sub = jax.lax.dynamic_index_in_dim(
+                            jnp.bfloat16(mem_arr), slot_idx, axis=0, keepdims=False
+                        )
+                        if mem_mask_b is None or (
+                            memory_block_k if memory_block_k is not None else h.memory_block_k
+                        ):
+                            kv_src = sub                       # target everywhere
+                        else:
+                            # Unsubstituted positions fall back to the draft's own
+                            # residual state, i.e. ordinary self-attention there.
+                            # That is the "without feedback memory" arm of the
+                            # paper's Figure 5 ablation (tau 3.352), and it is what
+                            # decode does for tokens still in flight.
+                            kv_src = jnp.where(mem_mask_b[0], sub, x)
+                else:
+                    if mem_arr is None:
+                        eff = bank
+                    elif mem_mask_b is None:
+                        eff = jnp.bfloat16(mem_arr)          # full substitution
+                    else:
+                        eff = jnp.where(mem_mask_b, jnp.bfloat16(mem_arr), bank)
+                    mem_mix = jnp.einsum("m,mbld->bld", w_row, jnp.float32(eff))
+                    x = x + jnp.bfloat16(mem_mix)
             else:
                 layer_weights, kv_layer, layer_rng_key = scanned_var
 
@@ -327,8 +542,31 @@ class Model:
             q = jnp.bfloat16(rms_norm(q) * ln_q)
             w_k = shardops.all_gather("M/d/s K/t D -> M K/t D", jnp.bfloat16(layer_weights.w_k))
             w_v = shardops.all_gather("M/d/s K/t D -> M K/t D", jnp.bfloat16(layer_weights.w_v))
-            k = shardops.einsum_unreduced("B/d L/s M, M K/t D -> B/d L/s K/t D", nx, w_k)
-            v = shardops.einsum_unreduced("B/d L/s M, M K/t D -> B/d L/s K/t D", nx, w_v)
+            # Queries always come from the draft's own hidden state; only the keys
+            # and values are re-sourced. With kv_src None (every non-SPIRe path)
+            # nkv IS nx, so this is bit-identical to what it replaced.
+            # In block mode `k`/`v` are the SELF source and the target source is
+            # projected separately below, so nkv does not come from kv_src.
+            #
+            # Without feedback memory the self source is the draft's own hidden
+            # state, i.e. ordinary self-attention over the k in-flight positions.
+            # With it, the self source is the feedback memory computed for those
+            # positions by an EARLIER forward pass -- supplied here rather than
+            # derived, because m_t depends on the final layer's output at t and so
+            # cannot be formed during the pass that produces it.
+            if self_memory is not None and block_masks is not None:
+                sm = jax.lax.dynamic_index_in_dim(
+                    jnp.bfloat16(self_memory), slot_idx, axis=0, keepdims=False
+                )
+                gsm = shardops.all_gather("B/d L/s M/t -> B/d L/s M", sm)
+                nkv = jnp.bfloat16(rms_norm(gsm) * ln_attn_in)
+            elif kv_src is None or block_masks is not None:
+                nkv = nx
+            else:
+                gkv = shardops.all_gather("B/d L/s M/t -> B/d L/s M", kv_src)
+                nkv = jnp.bfloat16(rms_norm(gkv) * ln_attn_in)
+            k = shardops.einsum_unreduced("B/d L/s M, M K/t D -> B/d L/s K/t D", nkv, w_k)
+            v = shardops.einsum_unreduced("B/d L/s M, M K/t D -> B/d L/s K/t D", nkv, w_v)
             k = save_for_backward(k)
             v = save_for_backward(v)
             ln_k = shardops.all_gather("K/t D/d/s -> K/t D", jnp.float32(layer_weights.ln_k))
@@ -337,10 +575,32 @@ class Model:
             v = shardops.all_gather("B/d L/s K/t D -> B/d L K/t D", v)
             if kv_layer is not None:
                 prev_k, prev_v = kv_layer
+                # WHERE a token's key and value land is not the same question as
+                # WHICH position it is. A dense cache makes them the same number,
+                # so kv_offset served both. A compact sliding-window cache does
+                # not: the slot is `sink + (pos - sink) % window` while the
+                # position stays absolute, and RoPE still needs the position.
+                # kv_write_index carries the slot; kv_offset keeps its meaning.
+                write_at = kv_offset if kv_write_index is None else kv_write_index
                 update_row = jax.vmap(lambda prev, new, off: jax.lax.dynamic_update_slice(prev, new, (off, 0, 0)))
-                k = update_row(prev_k, k, kv_offset)
-                v = update_row(prev_v, v, kv_offset)
-            qkv = dense_attention(q, k, v)
+                k = update_row(prev_k, k, write_at)
+                v = update_row(prev_v, v, write_at)
+            if block_masks is None:
+                qkv = dense_attention(q, k, v)
+            else:
+                # Block split: keys before the query's block come from the target,
+                # keys inside it from the draft itself. kv_src holds the target
+                # activations here (never blended), because which of the two applies
+                # is decided per (query, key) by the masks, not per position.
+                m_tgt, m_self = block_masks
+                gsel = shardops.all_gather("B/d L/s M/t -> B/d L/s M", kv_src)
+                nsel = jnp.bfloat16(rms_norm(gsel) * ln_attn_in)
+                k_t = shardops.einsum_unreduced("B/d L/s M, M K/t D -> B/d L/s K/t D", nsel, w_k)
+                v_t = shardops.einsum_unreduced("B/d L/s M, M K/t D -> B/d L/s K/t D", nsel, w_v)
+                k_t = jnp.bfloat16(rms_norm(k_t) * ln_k)
+                k_t = shardops.all_gather("B/d L/s K/t D -> B/d L K/t D", k_t)
+                v_t = shardops.all_gather("B/d L/s K/t D -> B/d L K/t D", v_t)
+                qkv = two_source_attention(q, k_t, v_t, m_tgt, k, v, m_self)
             ln_qkv = shardops.all_gather("Q K/t D/d/s -> Q K/t D", jnp.float32(layer_weights.ln_qkv))
             qkv = jnp.bfloat16(rms_norm(qkv) * ln_qkv)
             w_o = shardops.all_gather("M/d/s Q K/t D -> M Q K/t D", jnp.bfloat16(layer_weights.w_o))
@@ -389,15 +649,51 @@ class Model:
             )
             tensor_stats = jax.tree.map(lambda x: TensorStats.from_tensor(x), tensor_stats)
 
+            if use_bank:
+                # Write this layer's output into slot j+1 for the layers above.
+                # Only the additive pathway carries a bank; the "kv" pathway reads
+                # one slot per layer and never accumulates the draft's own states.
+                # Under external (training) memory the bank is frozen -- the target's
+                # states are the supervision and must not be overwritten by ours.
+                bank_out = jax.lax.dynamic_update_slice(
+                    bank, jnp.bfloat16(x)[jnp.newaxis], (slot_idx + 1, 0, 0, 0)
+                )
+                carry_out = (x, bank_out)
+            else:
+                carry_out = x
             if emit_activations:
-                return x, (kv_layer, tensor_stats, x)
-            return x, (kv_layer, tensor_stats)
+                return carry_out, (kv_layer, tensor_stats, x)
+            return carry_out, (kv_layer, tensor_stats)
 
-        use_memory = memory is not None
+        # Two memory phases, one pathway:
+        #   external (training): `memory` supplies the TARGET's states -- the
+        #       substitution the paper specifies as m_t^i = y_t^{i+6-1}.
+        #   self (inference): no target exists for tokens being drafted, so the
+        #       draft feeds back its OWN residual states, accumulated in `bank`
+        #       as the layer scan proceeds. This is what makes it FEEDBACK memory;
+        #       the target activations are training supervision, not a runtime input.
+        # w_memory defaults to the model's OWN field. It is a weight, not a caller
+        # argument, and requiring callers to pass it means any decode path that
+        # forgets silently runs a memory-trained draft without its memory -- which
+        # is precisely the failure that produced eval loss 12.88 and tau 1.000.
+        if w_memory is None and h.n_mem > 0:
+            w_memory = self.w_memory
+        use_memory = w_memory is not None and h.n_mem > 0
+        assert h.memory_mode in ("additive", "kv"), f"unknown memory_mode {h.memory_mode!r}"
+        # The "kv" pathway reads one slot per layer and never accumulates the
+        # draft's own states, so it does not need the bank -- which is [n_mem, B,
+        # L, M] and is not free to carry through a scan under autodiff.
+        kv_memory = use_memory and h.memory_mode == "kv"
+        use_bank = use_memory and not kv_memory
         if use_memory:
             assert w_memory is not None, "memory requires w_memory"
-            assert w_memory.shape == (h.layers, memory.shape[0]), (
-                f"w_memory must be [layers={h.layers}, n_mem={memory.shape[0]}], got {w_memory.shape}"
+            n_mem = memory.shape[0] if memory is not None else h.n_mem
+            if h.memory_mode == "kv":
+                assert n_mem >= h.layers, (
+                    f"kv memory reads one slot per layer, so n_mem ({n_mem}) must be "
+                    f">= layers ({h.layers})")
+            assert w_memory.shape == (h.layers, n_mem), (
+                f"w_memory must be [layers={h.layers}, n_mem={n_mem}], got {w_memory.shape}"
             )
             # DEPTH-CAUSAL MASK. Slot m holds the state at depth m; draft layer j
             # sits at depth j and may only read states strictly beneath it, i.e.
@@ -414,16 +710,55 @@ class Model:
             # a trained w_memory should show an all-zero upper triangle -- which is
             # a cheap post-hoc check that the mask was actually in force.
             depth = jnp.arange(h.layers)[:, None]
-            slot = jnp.arange(memory.shape[0])[None, :]
+            slot = jnp.arange(n_mem)[None, :]
             w_causal = jnp.where(slot <= depth, w_memory, 0.0)
-            scanned_vars = (self.transformer, kv_cache, layer_rngs, w_causal)
+            # Bank of residual states: slot 0 is the post-embedding state, slot m is
+            # layer m-1's output. Under self-memory only slot 0 is known up front;
+            # each layer writes its own output into slot j+1 as the scan proceeds,
+            # so layer j always finds slots 0..j filled and the causal mask makes
+            # the still-empty ones unreachable.
+            bank0 = jnp.zeros((n_mem,) + x.shape, dtype=jnp.bfloat16)
+            bank0 = bank0.at[0].set(jnp.bfloat16(x))
+            mem_arr = memory
+            # broadcast [B, L] -> [n_mem, B, L, M] for the read-time blend
+            mem_mask_b = (
+                memory_mask[jnp.newaxis, :, :, jnp.newaxis] if memory_mask is not None else None
+            )
+            # Per-(query, key) split of the ordinary mask into "the target has
+            # processed this key" and "the draft produced it itself". Positions
+            # only, so it is built once rather than per layer.
+            block_masks = None
+            bk = memory_block_k if memory_block_k is not None else h.memory_block_k
+            if kv_memory and bk and memory is not None:
+                assert shardops.axis_size("s") == 1, "block-split memory needs an unsharded sequence axis"
+                Lq = attention_mask.shape[1]
+                qpos = jnp.arange(Lq)[jnp.newaxis, :, jnp.newaxis]
+                kpos = jnp.arange(attention_mask.shape[2])[jnp.newaxis, jnp.newaxis, :]
+                block_start = (qpos // bk) * bk
+                from_target = kpos < block_start
+                self_vis = jnp.logical_not(from_target)
+                if h.feedback_memory:
+                    # z^i_t = Attention(x^i_t, m_<t): STRICTLY previous positions.
+                    # m_t is a mix over every layer state at t including the last,
+                    # so it does not exist until the pass at t has finished.
+                    self_vis = jnp.logical_and(self_vis, kpos < qpos)
+                block_masks = (
+                    jnp.logical_and(attention_mask, from_target),
+                    jnp.logical_and(attention_mask, self_vis),
+                )
+            scanned_vars = (self.transformer, kv_cache, layer_rngs, w_causal, jnp.arange(h.layers))
+            init_carry = (jnp.bfloat16(x), bank0) if use_bank else jnp.bfloat16(x)
         else:
+            block_masks = None
             scanned_vars = (self.transformer, kv_cache, layer_rngs)
+            init_carry = jnp.bfloat16(x)
+        embed_state = jnp.bfloat16(x)   # slot 0 of the feedback-memory state stack
         if emit_activations:
-            x, (kv_cache, ts, layer_acts) = jax.lax.scan(loop_body, jnp.bfloat16(x), scanned_vars)
+            carry, (kv_cache, ts, layer_acts) = jax.lax.scan(loop_body, init_carry, scanned_vars)
         else:
-            x, (kv_cache, ts) = jax.lax.scan(loop_body, jnp.bfloat16(x), scanned_vars)
+            carry, (kv_cache, ts) = jax.lax.scan(loop_body, init_carry, scanned_vars)
             layer_acts = None
+        x = carry[0] if use_bank else carry
 
         ##### Final layernorm and output projection.
         x = shardops.all_gather("B/d L/s M/t -> B/d L/s M", x)
@@ -453,7 +788,10 @@ class Model:
         )
 
         if emit_activations:
-            return logits, kv_cache, tensor_stats, layer_acts
+            # 5th element: the post-embedding state, slot 0 of the feedback-memory
+            # state stack. APPENDED rather than prepended so that every existing
+            # consumer's `out[3]` slice of layer outputs is untouched.
+            return logits, kv_cache, tensor_stats, layer_acts, embed_state
         return logits, kv_cache, tensor_stats
 
 
