@@ -535,3 +535,35 @@ first changes acceptance only in later rounds, and the second only at long
 context. The test compares draft **distributions** rather than sampled tokens,
 because an untrained draft's logits are near-uniform and its argmax is decided by
 float noise — comparing tokens would have passed a broken ring.
+
+### 10.3 The timing harness over-allocated the cache, against the control
+
+`bench_k.py` pinned `Klen` at `L + 1 + round(rounds * 1.25) * (k + 1) + k + 1`.
+The `(k + 1)` is the **maximum** tokens a round can yield — every round accepting
+every draft. That does not happen: measured τ runs 1.764 to 4.092 against a `k+1`
+of up to 9. The pin came out at 702 where about 586 is ever occupied.
+
+Since attention reads the whole allocation rather than the occupied part, the
+~116 surplus slots were charged to every timed cell. They were not charged
+evenly, and the direction is what makes it worth fixing:
+
+| draft | reads per step | pays for the surplus? |
+|---|---|---|
+| vanilla (dense) | all of `Klen` | **yes** |
+| MagicDec (windowed) | `sink + window + k` | no |
+| SPIRe (windowed) | `sink + window + k` | no |
+
+So the slack fell entirely on **vanilla, which is the control**, while the cost
+model charges vanilla for `B · L`. The measured baseline was inflated and the
+methods under test were not — a bias that flatters SPIRe.
+
+Sized from calibrated τ instead (`rounds * τ * 1.25`), the pin is 603: 14.1%
+smaller, ~3% headroom rather than ~20%. Also added an overrun check, because an
+out-of-bounds cache write does not raise — `dynamic_update_slice` clamps — so a
+run that outgrew a tighter buffer would corrupt the cache silently and still
+produce a plausible timing. It tests the longest row in the batch, not the mean.
+
+Note this does NOT invalidate the k=1..7 ITM divergence already measured: `Klen`
+was pinned to one value across every depth, so it cannot produce a trend in k.
+It shifts the absolute ITM levels, and it matters for the three-way comparison
+that has not been run yet.

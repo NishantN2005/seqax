@@ -173,9 +173,25 @@ def main() -> None:
             print(f"    k={k}: tau_ref {taus[k]:.3f} -> tau_probe {tau_c:.3f} "
                   f"-> rounds {rounds[k][0]}/{rounds[k][1]}")
 
-        # Tight Klen from calibrated tau, with 25% headroom on the round count so a
-        # run that accepts better than its probe still cannot overrun the buffer.
-        klen = max(L + 1 + int(rounds[k][1] * 1.25) * (k + 1) + k + 1 for k in ks)
+        # Klen has to reflect what a serving system would actually hold: the
+        # prompt, the tokens generated, and the k-token block in flight.
+        #
+        # The previous bound multiplied the round count by (k + 1) -- the MAXIMUM
+        # a round can yield, i.e. every round accepting every draft. That never
+        # happens: measured tau runs 1.8 to 4.1 against a k+1 of up to 9. It
+        # pinned Klen at 702 where about 600 is ever occupied, and since attention
+        # READS the whole allocation, the surplus was charged to every cell.
+        #
+        # The surplus is not charged evenly, which is why it mattered. A dense
+        # draft reads all of Klen, so VANILLA -- the control -- paid for ~100
+        # slots of slack it never fills, while the cost model charges it for
+        # B * L. A windowed draft reads sink + window + k whatever Klen is, so
+        # SPIRe and MagicDec never paid it. Sizing from measured tau removes a
+        # bias that ran against the baseline and flattered the method under test.
+        #
+        # 25% headroom on the token count, not the round count, so a run that
+        # accepts better than its probe still cannot overrun the buffer.
+        klen = max(L + 1 + int(rounds[k][1] * calib[k] * 1.25) + k + 1 for k in ks)
         klen = max(klen, L + 1 + G2 + max(ks) + 1)
         print(f"\nKlen PINNED to {klen} for every timed configuration\n")
 
@@ -202,15 +218,28 @@ def main() -> None:
                     s1 = make_speculative_generate(h_t, h_d, L, r1, k, 0.0, klen=klen)
                     o1 = jax.block_until_ready(s1(w_t, w_d, prompt, rng))
                     n1 = float(np.mean(np.asarray(o1[1])))
+                    n1max = float(np.max(np.asarray(o1[1])))
                     ts1, js1 = timeit(lambda: s1(w_t, w_d, prompt, rng), args.reps)
                 with shardtypes.Scope():
                     s2 = make_speculative_generate(h_t, h_d, L, r2, k, 0.0, klen=klen)
                     o2 = jax.block_until_ready(s2(w_t, w_d, prompt, rng))
                     n2 = float(np.mean(np.asarray(o2[1])))
+                    n2max = float(np.max(np.asarray(o2[1])))
                     ts2, js2 = timeit(lambda: s2(w_t, w_d, prompt, rng), args.reps)
             except Exception as e:  # noqa: BLE001
                 print(f"{k:>3}   FAILED: {type(e).__name__}: {e}")
                 rows.append({"k": k, "failed": f"{type(e).__name__}"})
+                continue
+
+            # A tighter Klen is only honest if the run fit inside it. An
+            # out-of-bounds cache write does not raise -- dynamic_update_slice
+            # CLAMPS -- so an overrun corrupts the cache silently and still
+            # produces a plausible timing. Check the longest row, not the mean.
+            need = L + 1 + int(max(n1max, n2max)) + k + 1
+            if need > klen:
+                print(f"{k:>3}   REJECTED: overran Klen ({need} > {klen}); "
+                      f"raise the headroom above 25%")
+                rows.append({"k": k, "rejected": f"overran klen {need}>{klen}"})
                 continue
 
             jit = max(js1, js2)
