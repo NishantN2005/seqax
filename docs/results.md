@@ -4,37 +4,49 @@ Everything measured so far in the SPIRe reproduction. Companion to
 [fidelity-ledger.md](fidelity-ledger.md), which records what these numbers can and
 cannot be compared against.
 
-As of 2026-09-03: both baselines are complete, **Phase A of the SPIRe draft**
-(pruned init + sparse-mask training + MixedLoss with distillation and α) is trained
-and measured, and **Phase B** (Phase A plus target-activation substitution with a
-rollout split) is trained and measured. Phase B is a NEGATIVE result -- see
-Finding 9.
+As of 2026-09-08: **all three of the paper's draft models are trained and Table 1
+is reproduced end to end** at the paper's own configuration -- fixed window 64,
+sink 1, k=4, G=64 generated tokens, ~1,200 contexts per cell.
+
+The "Phase A / Phase B" naming below is superseded. Phase A is the Figure 5
+ablation *without feedback memory and without attending to target activations*
+(published 2.959); Phase B implemented an operator the paper does not describe
+(memory added into the residual stream at the same position, rather than
+replacing the keys and values read from previous positions) and is withdrawn.
+The model that carries every measurement from here is `spire_draft_spire_full`,
+which has all six techniques Figure 5 ablates.
 
 ---
 
 ## Models trained
 
-| | target | vanilla draft | SPIRe Phase A | SPIRe Phase B |
+| | target | vanilla draft | SPIRe ablation | **SPIRe (full)** |
 |---|---|---|---|---|
+| config | `spire_target_1024` | `spire_draft_vanilla` | `spire_draft_spire` | `spire_draft_spire_full` |
 | layers / d_model | 8 / 512 | 4 / 256 | 2 / 512 | 2 / 512 |
 | d_head / d_ff | 128 / 4096 | 64 / 2048 | 128 / 4096 | 128 / 4096 |
-| body params | 67,117,056 | 8,390,656 (= 1/8) | 16,779,264 (= 1/4) | 16,779,264 |
-| total params | 118,628,352 | 34,146,304 | 68,290,560 | 68,290,560 |
+| body params | 67,117,056 | 8,390,656 (= 1/8) | 16,779,264 (= 1/4) | 16,779,264 (= 1/4) |
+| total params | 118,628,352 | 34,146,304 | 68,290,560 | 68,299,782 |
 | training tokens | 2,372,567,040 | 682,926,080 | 1,365,811,200 | 1,365,811,200 |
 | steps @ batch 64 × 1024 | 36,203 | 10,421 | 20,841 | 20,841 |
-| attention at training | dense | dense | **sink 1, window 64** | sink 1, window 64 |
-| initialization | random | random | **pruned: target [6:8)** | pruned: target [6:8) |
-| loss | hard CE | hard CE | **0.5·distill_CE + 0.5·(−α)** | same |
-| target-activation memory | — | — | none | **n_mem 3, causal, rollout split** |
-| **final eval loss** | **2.534** (σ 0.231) | **3.067** (σ 0.240) | **3.000** | **3.661** |
-| perplexity | 12.6 | 21.5 | 20.1 | 38.9 |
-| **τ @ L=512, T=1.0** | — | 2.566 | **2.851** | 2.769 |
-| wall time (H100 PCIe) | ~5.5 h | ~45 min | ~2.5 h | ~3 h |
+| attention at training | dense | dense | sink 1, window 64 | sink 1, window 64 |
+| initialization | random | random | pruned: target [6:8) | pruned: target [6:8) |
+| loss | hard CE | hard CE | 0.5·distill_CE + 0.5·(−α) | same |
+| target activations as K/V | — | — | no | **yes** |
+| feedback memory | — | — | no | **yes, n_mem 3** |
+| **τ @ L=512, T=1.0** | — | **2.594** | **2.834** | **3.140** |
+| paper's value for it | — | 2.647 | 2.959 | 3.401 |
+| wall time (H100 PCIe) | ~5.5 h | ~45 min | ~2.5 h | **~7 h** |
 
-Phase B's eval loss is measured **memory-free** (eval supplies no teacher), which is
-also the decode condition. It is worse than Phase A's because Phase B spent only
-~37.5% of training in that regime against Phase A's 100% — the likely cause of its
-lower τ. See Finding 9.
+The full model's wall time is 2.2× the ablation's at the same step count: feedback
+memory runs k sequential forward passes per step, each rematerialised in the
+backward. 0.833 steps/s against 1.83.
+
+Its **eval loss is not comparable** and is omitted deliberately. Eval supplies no
+teacher, so `memory=None` and the draft falls back to computing its own keys and
+values everywhere — which is not its deployment condition, where the target's
+activations are available for every committed position. τ at decode is the metric
+that describes this model.
 
 Note the SPIRe draft beats the vanilla draft on held-out hard-target CE (3.000 vs
 3.067) **while attending to only 64 tokens rather than 1024**. Eval loss is measured
@@ -70,58 +82,110 @@ can exceed, and the analytical cost model cannot see it.
 
 ---
 
-## τ measurements (k=4, sink=1, window=L/8, 128 contexts × 8 rounds)
+## τ: Table 1 reproduced (fixed window 64, sink 1, k=4, G=64 tokens)
 
-### Vanilla speculative decoding
+The paper's own configuration, measured on ~1,200 validation contexts per cell
+with the paper's stopping rule (score the rounds a context needs to emit 64
+tokens, not a fixed round count). Raw `[contexts, rounds]` accept matrices are
+saved under `~/tau_raw/`, so any statistic here can be recomputed without a GPU.
 
-| L | τ (T=0.0) | acc. | τ (T=1.0) | acc. |
-|---|---|---|---|---|
-| 256 | 2.800 ± 0.099 | 0.450 | 2.349 ± 0.091 | 0.337 |
-| **512** | 2.931 ± 0.101 | 0.483 | **2.566 ± 0.096** | 0.392 |
-| 1024 | 2.949 ± 0.100 | 0.487 | 2.646 ± 0.097 | 0.412 |
+### T = 1.0 — the paper's regime
 
-### MagicDec (target weights, sparse mask at decode, cache-relative RoPE)
+| L | Vanilla (ours) | paper | MagicDec (ours) | paper | SPIRe (ours) | paper |
+|---|---|---|---|---|---|---|
+| 960 | 2.580 ± 0.017 | 2.644 | 3.554 ± 0.021 | 3.793 | 3.106 ± 0.020 | 3.382 |
+| **512** | **2.594 ± 0.018** | 2.647 | **3.648 ± 0.021** | 3.891 | **3.140 ± 0.020** | 3.401 |
+| 256 | 2.590 ± 0.018 | 2.637 | 3.781 ± 0.021 | 4.005 | 3.139 ± 0.020 | 3.427 |
 
-| L | τ (T=0.0) | acc. | τ (T=1.0) | acc. |
-|---|---|---|---|---|
-| 256 | 2.921 ± 0.102 | 0.480 | 3.307 ± 0.098 | 0.577 |
-| **512** | 3.462 ± 0.101 | 0.615 | **3.763 ± 0.096** | 0.691 |
-| 1024 | 3.586 ± 0.099 | 0.646 | 3.725 ± 0.095 | 0.681 |
+Gap to the paper: vanilla −1.8% to −2.4%, MagicDec −5.6% to −6.3%, SPIRe −7.7%
+to −8.4%. The ordering MagicDec > SPIRe > vanilla holds at every context length,
+as published.
 
-### SPIRe draft, Phase A (pruned init + sparse training + distill + α; no target activations)
+### The dependence on L reproduces more closely than the level
 
-| L | window | τ (T=0.0) | acc. | τ (T=1.0) | acc. |
-|---|---|---|---|---|---|
-| 256 | 32 | 2.590 ± 0.098 | 0.397 | 2.536 ± 0.095 | 0.384 |
-| **512** | **64** | **2.856 ± 0.100** | 0.464 | **2.851 ± 0.102** | 0.463 |
-| 1024 | 128 | 1.458 ± 0.049 | 0.115 | 1.558 ± 0.057 | 0.139 |
+| | spread across L, ours | spread across L, paper |
+|---|---|---|
+| vanilla | 0.5% | 0.4% |
+| SPIRe | 1.1% | 1.3% |
+| **MagicDec** | **6.4%, decreasing in L** | **5.6%, decreasing in L** |
 
-### SPIRe draft, Phase B (Phase A + target-activation substitution + rollout split)
+MagicDec is the only method whose τ genuinely moves with context length, and it
+moves in the same direction and by nearly the same amount as the paper's. It is
+also the only method whose draft is the full target model, so it has the most to
+lose from a sparse cache as the context it cannot see grows. This supersedes the
+earlier claim that τ is not constant in L, which was measured while the window
+was being varied along with L and is withdrawn.
 
-| L | window | τ (T=0.0) | acc. | τ (T=1.0) | acc. |
-|---|---|---|---|---|---|
-| 256 | 32 | 1.116 ± 0.021 | 0.029 | 1.214 ± 0.033 | 0.053 |
-| **512** | **64** | **2.725 ± 0.100** | 0.431 | **2.769 ± 0.099** | 0.442 |
-| 1024 | 128 | 1.576 ± 0.052 | 0.144 | 1.649 ± 0.059 | 0.162 |
+### T = 0.0 — greedy does not discriminate
 
-Phase B vs Phase A at T=1.0: **−52% at L=256, −2.9% at L=512, +5.8% at L=1024.**
-Target-activation substitution is credited with +0.393 τ in the paper; under our
-reading it costs 0.082 at the matched-window point. See Finding 9.
-
-### Against the paper (L=512)
-
-| | paper | ours T=0.0 | ours T=1.0 |
+| L | Vanilla | MagicDec | SPIRe |
 |---|---|---|---|
-| vanilla | 2.647 | 2.931 (**+10.7%**) | 2.566 (**−3.1%**) |
-| magicdec | 3.891 | 3.462 (**−11.0%**) | 3.763 (**−3.3%**) |
-| spire (full) | 3.401 | — | 2.851 (−16.2%) |
-| **spire, no FM, no target acts** | **2.959** | 2.856 (−3.5%) | **2.851 (−3.6%)** |
-| spire, no FM (Phase B target) | 3.352 | 2.725 (−18.7%) | 2.769 (−17.4%) |
+| 960 | 3.351 ± 0.034 | 3.410 ± 0.035 | 3.250 ± 0.034 |
+| 512 | 3.333 ± 0.034 | 3.434 ± 0.035 | 3.224 ± 0.033 |
+| 256 | 3.240 ± 0.033 | 3.688 ± 0.035 | 3.352 ± 0.034 |
 
-Phase A implements neither feedback memory nor target-activation substitution, so
-`spire_no_fm_no_target_acts = 2.959` is its correct comparison point — not full
-SPIRe, and not `spire_no_feedback_memory`. Against it we are **3.6% low at T=1.0**,
-matching the 3.1–3.3% shortfall of both baselines. See Finding 6.
+The three methods compress into a narrow band and **the ordering inverts** --
+vanilla beats SPIRe at L=512 and L=960. Greedy decoding makes all three drafts
+agree with the target far more often, which flatters the weak draft most. Any
+paper reporting τ without stating a temperature is under-determined by roughly
+the size of the effect it claims.
+
+---
+
+## What the memory pathway is worth, measured
+
+All four numbers below come from the same harness, so they are directly
+comparable -- an earlier version of this comparison mixed a fixed-round
+measurement with a token-budget one.
+
+| model | ours | paper | gap |
+|---|---|---|---|
+| SPIRe ablation (no feedback memory, no target activations) | 2.834 ± 0.019 | 2.959 | −4.2% |
+| SPIRe full (all six techniques) | 3.140 ± 0.020 | 3.401 | −7.7% |
+| **the memory pathway is worth** | **+0.306** | **+0.442** | **69% captured** |
+
+The pathway works and it is the largest single contributor we added, but it
+delivers about two thirds of its published benefit. Three candidate explanations
+were tested and eliminated:
+
+1. **Measurement convention.** Re-running the ablation under the current harness
+   gives 2.834 against the 2.851 recorded under the old one -- 0.6%, inside
+   run-to-run jitter. Not the cause.
+2. **Mixing-weight initialisation.** `w_memory` is zero-initialised, which under
+   a softmax is a *uniform* mix rather than a no-op, so the draft might have
+   started somewhere unhelpful and stayed. It did not: the trained weights are
+
+   |  | embed | layer 0 out | layer 1 out |
+   |---|---|---|---|
+   | draft layer 0 | 0.264 | 0.634 | 0.102 |
+   | draft layer 1 | 0.115 | 0.555 | 0.330 |
+
+   against 0.333 uniform. Both layers concentrated on layer 0's output. Not the
+   cause.
+3. **A window off-by-one.** Feedback memory reads `m_<t` strictly, so a window of
+   64 leaves 63 *readable* memory vectors; the paper may intend 64. Measured at
+   both: SPIRe 3.127 → 3.131 (+0.13%, 0.14σ), MagicDec 3.688 → 3.717. SPIRe is
+   indifferent and MagicDec — which has no feedback memory and does read its own
+   slot — moved seven times more, the opposite of the prediction. Not the cause.
+
+What remains, in order of plausibility:
+
+- **Document diversity.** Ledger §2.3: the surviving mirror holds ~10% of
+  LongCrawl64, and at the paper's `dataset_seqlen` of 1024 it yields 0.65B tokens
+  against a 2.37B Chinchilla budget. We use 4096, which buys the tokens at the
+  cost of ~4× fewer distinct documents. **This is not fixable by retraining** --
+  the documents do not exist in the mirror. It also fits the shape of the gap:
+  the dense draft is −2% while both sparse drafts are −4% to −8%, and a draft
+  learning to exploit a narrow window plus target activations plausibly needs
+  more diversity than one that simply reads everything.
+- **Attribution between the two memory components.** Our +0.306 cannot be split
+  into target-activations and feedback memory without the intermediate arm
+  (published 3.352), which was deliberately not trained. That run is ~3.2h (no
+  k-pass loop) and is the outstanding diagnostic.
+
+Note that the τ shortfall does **not** propagate into the cost-model validation:
+`ITM_measured = τ_obs / speedup` and `speedup = t_plain / (t_round/τ_obs)`, so τ
+cancels and the measured ITM is a pure timing ratio.
 
 ---
 
@@ -159,21 +223,24 @@ does not, and sampling penalizes precisely that.
 advantage is 0.53 greedy and 1.20 at T=1 — it more than doubles on an unstated
 hyperparameter.
 
-### 3. τ is not constant in L — the cost model assumes it is
+### 3. ~~τ is not constant in L~~ — WITHDRAWN, and replaced by a real version
 
-MagicDec at T=1.0 measures 3.307 → 3.763 → 3.725 across L = 256/512/1024: a **14%
-range**. `calculate_itm` takes the single L=512 measurement and reuses it unchanged
-out to L=8192.
+~~MagicDec at T=1.0 measures 3.307 → 3.763 → 3.725 across L = 256/512/1024: a 14%
+range, and `calculate_itm` reuses the single L=512 value out to L=8192.~~
 
-The dense (vanilla) draft keeps improving with context while the sparse (MagicDec)
-draft plateaus — the MagicDec-minus-vanilla gap runs 0.958 → 1.197 → 1.079. That is
-the predicted mechanism: MagicDec's window grows only as L/8, so the *absolute*
-hidden context expands with L. It is exactly what feedback memory exists to
-counteract.
+Withdrawn on two counts. The measurement varied the *window* as L/8 alongside L,
+so it compared drafts with 32-, 64- and 128-token caches and attributed the result
+to context length; and the paper's Table 1 already reports τ at three context
+lengths, so this was never an untested assumption.
 
-**Caveat:** MagicDec's 512→1024 dip (3.763 vs 3.725) sits well inside the
-confidence intervals. This is *consistent with* the hypothesis, not established by
-it; it needs longer L to become a result.
+What survives, measured properly at fixed window 64, is narrower and stands up:
+**MagicDec's τ does drift with L, and only MagicDec's.** Across L = 256/512/960 we
+measure 3.781 → 3.648 → 3.554, a 6.4% range decreasing in L, against the paper's
+4.005 → 3.891 → 3.793 (5.6%, same direction). Vanilla moves 0.5% and SPIRe 1.1%.
+MagicDec is the one method whose draft is the full target model, so it has the
+most to lose as the context its window cannot reach grows. The cost model's
+assumption that τ is L-invariant is a good approximation for two of the three
+methods and a ~6% one for MagicDec.
 
 ### 4. A decode off-by-one invalidated all prior τ (found and fixed)
 

@@ -109,6 +109,10 @@ def main() -> None:
     p.add_argument("--max-jitter", type=float, default=0.10)
     p.add_argument("--hoi", type=float, default=HOI_H100_PCIE)
     p.add_argument("--out", default=None)
+    p.add_argument("--klen", type=int, default=None,
+                   help="pin the KV allocation explicitly. REQUIRED for comparing modes: the "
+                        "target's cache is the denominator of every ITM, so if two modes size it "
+                        "differently their numbers are not comparable.")
     args = p.parse_args()
 
     taus = {int(kv.split(":")[0]): float(kv.split(":")[1]) for kv in args.taus.split(",")}
@@ -224,26 +228,32 @@ def main() -> None:
             print(f"    k={k}: tau_ref {taus[k]:.3f} -> tau_probe {tau_c:.3f} "
                   f"-> rounds {rounds[k][0]}/{rounds[k][1]}")
 
-        # Klen has to reflect what a serving system would actually hold: the
-        # prompt, the tokens generated, and the k-token block in flight.
+        # Klen sizing, and why it is the worst case rather than the average.
         #
-        # The previous bound multiplied the round count by (k + 1) -- the MAXIMUM
-        # a round can yield, i.e. every round accepting every draft. That never
-        # happens: measured tau runs 1.8 to 4.1 against a k+1 of up to 9. It
-        # pinned Klen at 702 where about 600 is ever occupied, and since attention
-        # READS the whole allocation, the surplus was charged to every cell.
+        # An earlier version sized it from measured tau with 25% headroom, on the
+        # theory that (k+1) tokens per round -- every round accepting every draft
+        # -- never happens. Per round that is true; across a BATCH it is not.
+        # Acceptance has a heavy upper tail: at k=8 a single predictable passage
+        # generated ~125 tokens against a 64-token budget by accepting nearly all
+        # 9 every round, and the guard below rejected six of eight depths. A
+        # cache must hold the longest row, not the average one.
         #
-        # The surplus is not charged evenly, which is why it mattered. A dense
-        # draft reads all of Klen, so VANILLA -- the control -- paid for ~100
-        # slots of slack it never fills, while the cost model charges it for
-        # B * L. A windowed draft reads sink + window + k whatever Klen is, so
-        # SPIRe and MagicDec never paid it. Sizing from measured tau removes a
-        # bias that ran against the baseline and flattered the method under test.
+        # So: the true worst case, which cannot overrun. It over-allocates
+        # relative to real occupancy, and that surplus is NOT charged evenly --
+        # a dense draft reads all of Klen while a windowed draft reads its window
+        # regardless -- so it works against vanilla, the control. That is a stated
+        # limitation of these numbers rather than a hidden one; the alternative,
+        # sizing from a measured maximum, needs a second compile of all 16 timing
+        # functions per depth and buys a few percent.
         #
-        # 25% headroom on the token count, not the round count, so a run that
-        # accepts better than its probe still cannot overrun the buffer.
-        klen = max(L + 1 + int(rounds[k][1] * calib[k] * 1.25) + k + 1 for k in ks)
-        klen = max(klen, L + 1 + G2 + max(ks) + 1)
+        # --klen overrides, and comparing modes REQUIRES it: the target's cache is
+        # the denominator of every ITM here, so two modes that size it differently
+        # are not measuring the same denominator.
+        if args.klen:
+            klen = args.klen
+        else:
+            klen = max(L + 1 + rounds[k][1] * (k + 1) + k + 1 for k in ks)
+            klen = max(klen, L + 1 + G2 + max(ks) + 1)
         print(f"\nKlen PINNED to {klen} for every timed configuration\n")
 
         # ---- Baseline: plain target decoding, same pinned Klen ----
