@@ -109,6 +109,12 @@ def main() -> None:
     p.add_argument("--max-jitter", type=float, default=0.10)
     p.add_argument("--hoi", type=float, default=HOI_H100_PCIE)
     p.add_argument("--out", default=None)
+    p.add_argument("--temperature", type=float, default=1.0,
+                   help="must match the temperature the reference taus were measured at. The "
+                        "cross-check compares against tau.py, which reports T=1.0; timing at "
+                        "T=0.0 against those references disagreed by 33 percent on vanilla and "
+                        "barely at all on MagicDec, which is the temperature effect documented "
+                        "in results.md rather than a timing fault.")
     p.add_argument("--klen", type=int, default=None,
                    help="pin the KV allocation explicitly. REQUIRED for comparing modes: the "
                         "target's cache is the denominator of every ITM, so if two modes size it "
@@ -217,7 +223,7 @@ def main() -> None:
         for k in ks:
             with shardtypes.Scope():
                 sp = make_speculative_generate(
-                    h_t, h_d, L, probe, k, 0.0, klen=probe_klen,
+                    h_t, h_d, L, probe, k, args.temperature, klen=probe_klen,
                     draft_sink=args.sink, draft_window=d_window,
                     draft_prefill_dense=prefill_dense, magicdec_rope=mdrope,
                     compact_draft_cache=True)
@@ -269,10 +275,10 @@ def main() -> None:
         # setup, and ZERO iterations of the loop whose cost we are after -- so
         # the difference is G2-1 iterations of one program.
         with shardtypes.Scope():
-            g0f = make_generate(h_t, L, 1, 0.0, klen=klen)
+            g0f = make_generate(h_t, L, 1, args.temperature, klen=klen)
             t0, j0 = timeit(lambda: g0f(w_t, prompt, rng), args.reps)
         with shardtypes.Scope():
-            g2f = make_generate(h_t, L, G2, 0.0, klen=klen)
+            g2f = make_generate(h_t, L, G2, args.temperature, klen=klen)
             t2, j2 = timeit(lambda: g2f(w_t, prompt, rng), args.reps)
         j1 = j0
         tpt_plain = (t2 - t0) / (G2 - 1)
@@ -307,7 +313,7 @@ def main() -> None:
             try:
                 with shardtypes.Scope():
                     s0 = make_speculative_generate(
-                        h_t, h_d, L, 0, k, 0.0, klen=klen,
+                        h_t, h_d, L, 0, k, args.temperature, klen=klen,
                         draft_sink=args.sink, draft_window=d_window,
                         draft_prefill_dense=prefill_dense, magicdec_rope=mdrope,
                         compact_draft_cache=True)
@@ -315,7 +321,7 @@ def main() -> None:
                     ts0, js0 = timeit(lambda: s0(w_t, w_d, prompt, rng), args.reps)
                 with shardtypes.Scope():
                     sN = make_speculative_generate(
-                        h_t, h_d, L, R, k, 0.0, klen=klen,
+                        h_t, h_d, L, R, k, args.temperature, klen=klen,
                         draft_sink=args.sink, draft_window=d_window,
                         draft_prefill_dense=prefill_dense, magicdec_rope=mdrope,
                         compact_draft_cache=True)

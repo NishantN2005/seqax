@@ -280,9 +280,21 @@ def make_speculative_generate(
                                draft_sink + (dp_safe - start[:, None]))
             rope_k = jnp.maximum(rope_k, 0).astype(jnp.int32)
             rope_q = (draft_sink + (pos - start))[:, None].astype(jnp.int32)
-        else:
+        elif ring:
+            # A ring slot's index is unrelated to the position it holds, so the
+            # keys' rotations have to be looked up per row.
             rope_k = dp_safe
             rope_q = q_pos[:, :, 0].astype(jnp.int32)
+        else:
+            # A DENSE cache stores position p at slot p, so slot_pos is exactly
+            # arange and passing it explicitly asks for a [B, Klen] per-row
+            # rotation that computes the same thing the broadcast path does --
+            # at L=512 that is 64x768x8x128 elements rotated per layer per step
+            # instead of one shared vector, and it slowed every timed cell by
+            # ~17x. Uniformly, so it preserved monotonicity while making the
+            # absolute numbers meaningless. None selects the broadcast path.
+            rope_k = None
+            rope_q = None
 
         def run(cache):
             with shardtypes.Scope():
