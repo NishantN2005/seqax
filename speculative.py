@@ -559,16 +559,36 @@ def make_speculative_generate(
 
     model_spec = shardtypes.make_partition_specs(Model)
 
+    # The jitted callable is built ONCE and cached, not rebuilt per call.
+    #
+    # This previously read `return jax.jit(fn)(...)` inside the call body, which
+    # constructs a fresh shard_map and a fresh jit wrapper on every invocation.
+    # JAX keys its compilation cache on the wrapper, so a new one every call
+    # misses it and RECOMPILES the whole program -- every time. That is what made
+    # a speculative call cost 7-22 seconds against plain decode's 54 ms: the
+    # measurement was timing compilation, not decoding. It also explains why the
+    # cost was flat in the round count (compile time barely depends on it) and
+    # why it swung 30% between runs.
+    #
+    # decode.py had it right all along, with @jax.jit applied as a decorator at
+    # construction. The manual shard_map is kept here only because the return
+    # arity varies with return_drafts, which the annotation-driven
+    # typed_shard_map cannot express.
+    _cache = {}
+
     def spec_generate(w_t: Model, w_d: Model, prompt: jax.Array, rng: jax.Array):
         mesh = jax._src.mesh.thread_resources.env.physical_mesh
-        fn = jax.experimental.shard_map.shard_map(
-            spec_generate_local,
-            mesh=mesh,
-            in_specs=(model_spec, model_spec, P("d", None), P(None)),
-            out_specs=(P("d", None), P("d"), P("d", None))
-            + ((P("d", None), P("d", None, None, None)) if return_drafts else ()),
-            check_rep=False,
-        )
-        return jax.jit(fn)(w_t, w_d, prompt, rng)
+        key = id(mesh)
+        if key not in _cache:
+            fn = jax.experimental.shard_map.shard_map(
+                spec_generate_local,
+                mesh=mesh,
+                in_specs=(model_spec, model_spec, P("d", None), P(None)),
+                out_specs=(P("d", None), P("d"), P("d", None))
+                + ((P("d", None), P("d", None, None, None)) if return_drafts else ()),
+                check_rep=False,
+            )
+            _cache[key] = jax.jit(fn)
+        return _cache[key](w_t, w_d, prompt, rng)
 
     return spec_generate
