@@ -427,97 +427,90 @@ A third observation worth keeping: memory training made the draft markedly more
 brittle to window mismatch. At L=256 Phase A lost 9% while Phase B lost 52%,
 compounding Finding 7.
 
-### 10. Measured ITM exceeds the cost model by ~2x, and the cause is not simple overhead
+### 10. The cost model is optimistic by a flat ~25%, and its RATIOS reproduce exactly
 
-> **WITHDRAWN 2026-09-08.** Every ITM number in this section was produced by
-> differencing two generation lengths, and that method is invalid here. See
-> "Why these numbers are withdrawn" at the end of the section. The measurement is
-> being redone; the qualitative claim (measured cost exceeds the model) is *not*
-> currently supported by anything published here.
+**Objective #1, complete.** All three draft models timed end to end on an H100
+PCIe at the paper's operating point: B=64, L=512, T=1.0, k=1..8, HOI=756, with
+`Klen` pinned to 768 across every cell so the target's cache -- the denominator of
+every ITM -- is identical for all three. Validation passes in all three modes:
+ITM monotonic in k, worst jitter 1.7% against a 10% threshold, token ranges
+matched to 3.8-8.0%.
 
-**First end-to-end timing of the paper's cost model** (objective #1). Vanilla
-speculative decoding, H100 PCIe, HOI=756, k=4. ITM was measured as a SLOPE between
-two generation lengths (G=32 vs 160, 7 reps), intended to cancel prefill and
-compile cost; cells whose inter-quartile jitter exceeded 10% were rejected.
+#### Measured / predicted ITM
 
-| B | L | t_step (ms) | t_round (ms) | ITM meas | ITM pred | err |
-|---|---|---|---|---|---|---|
-| 4 | 512 | 1.414 | 9.468 | 6.696 | 1.667 | +302% |
-| 16 | 512 | 2.752 | 12.499 | 4.542 | 1.833 | +148% |
-| 64 | 512 | 8.620 | 42.997 | 4.988 | 1.944 | +157% |
-| 4 | 1024 | 1.774 | 6.746 | 3.803 | 1.750 | +117% |
-| 16 | 1024 | 4.114 | 15.378 | 3.738 | 1.900 | +97% |
-| 64 | 1024 | 13.810 | 53.944 | 3.906 | 1.971 | +98% |
+| | k=1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | mean |
+|---|---|---|---|---|---|---|---|---|---|
+| Vanilla | 1.33 | 1.30 | 1.31 | 1.30 | 1.28 | 1.27 | 1.26 | 1.25 | **1.29** |
+| MagicDec | 1.32 | 1.29 | 1.26 | 1.25 | 1.23 | 1.21 | 1.18 | 1.17 | **1.24** |
+| SPIRe | 1.15 | 1.17 | 1.19 | 1.23 | 1.23 | 1.26 | 1.25 | 1.27 | **1.22** |
 
-**The model under-predicts cost by 2-3x, in the direction of optimism**, and the
-error *plateaus* near +98% rather than converging.
+Across all 24 cells the model is optimistic by **1.15x to 1.33x, mean 1.25x**.
+That is a roughly constant factor, not a structural failure, and it supersedes
+both withdrawn estimates (2-3x, and 30-40%).
 
-Absolute anchor: at B=64, L=512 the target step touches 604M elements = 1.21 GB in
-bf16, which at 2 TB/s should take 0.6 ms. Measured 8.62 ms -- **14x off the memory
-roofline the model assumes.**
+#### Throughput, measured
 
-**A fixed per-pass overhead does NOT explain it.** Solving
-`t_step = c + w_t`, `t_round = 6c + 5·w_d + w_t` (a round is k=4 drafts + the
-hole-closing pass + verify) per cell gives c ranging 0.81-6.34 ms, scaling with B,
-and one cell yields a negative w_t. Hypothesis rejected.
+`τ / ITM`, pairing measured ITM with the 600-context τ of §"τ vs speculation
+depth" rather than the 64-context sample the timing batch provides:
 
-What the data points to instead: per-pass costs that scale with **B x Klen but not
-with model size** -- mask construction, RoPE table, cache indexing. A speculative
-round pays them 6 times against a plain step's once, and they do not shrink when
-the draft does, which would also explain why the draft never realizes its 4-6x
-element-count advantage. **Untested**; profiling is the next step.
+| | k=1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|---|
+| SPIRe | 1.454 | 1.805 | 2.004 | **2.078** | **2.162** | 2.141 | 2.152 | 2.096 |
+| MagicDec | 1.145 | 1.376 | 1.499 | **1.559** | 1.576 | 1.578 | **1.586** | 1.568 |
+| Vanilla | 1.005 | **1.091** | 1.067 | **1.021** | 0.968 | 0.915 | 0.858 | 0.815 |
 
-**Caveat, prominent:** this implementation is unoptimized -- mask-based attention
-rather than a compact cache, no fused kernels, a 67M model. A production serving
-stack sits far closer to roofline. The defensible claim is "the model omits costs
-that dominate at these scales," not "the model is wrong."
+#### The paper's headline claims reproduce
 
-### Why these numbers are withdrawn
+| at k=4 | measured | paper Fig. 4 | measured/predicted |
+|---|---|---|---|
+| Vanilla | 1.021 | 1.36 | 0.75 |
+| MagicDec | 1.559 | 2.05 | 0.76 |
+| SPIRe | 2.078 | 2.78 | 0.75 |
 
-The slope differenced two generation lengths to cancel prefill:
+Every absolute lands at **0.75-0.76** of prediction -- again strikingly uniform.
+The paper's actual claims are *ratios between methods*, and a common factor
+cancels out of a ratio:
 
-```
-t(long)  = prefill + R_long  x per_round
-t(short) = prefill + R_short x per_round
-```
+| | measured | paper |
+|---|---|---|
+| SPIRe over vanilla | **+104%** | +104% |
+| SPIRe over MagicDec | **+33%** | +36% |
 
-`num_rounds` is a **static** argument to `make_speculative_generate`: it fixes the
-length of a `lax.scan`, so each round count is a *separate XLA compilation* with
-its own fusion and scheduling. The two lines above are therefore not the same
-`prefill` and the same `per_round`, and subtracting them leaves the quantity of
-interest plus a contamination term that is pure compiler difference.
+The paper claims "over 100% versus vanilla, over 35% versus MagicDec". On
+hardware, at its own operating point: **+104% and +33%**. At each method's own
+best depth, +98% and +36%.
 
-It is not a small effect. On the three-model rerun, vanilla measured **3.2x
-cheaper per token at k=5 than at k=4** -- impossible, since depth 5 runs strictly
-more draft passes. SPIRe inverted between k=3 and k=4 the same way. All three
-modes failed the monotonicity gate.
+**This is the central result.** The cost model mispredicts every absolute
+throughput by a quarter, and predicts the differences between methods almost
+exactly. A roofline model that omits a constant overhead fraction will do
+precisely that, and it means the paper's comparative conclusions survive
+measurement even though its absolute numbers do not.
 
-It was invisible to the jitter check by construction: `timeit` measures one
-compiled program repeatedly, so it captures run-to-run variance (1-5%, well inside
-threshold) and is structurally blind to compilation-to-compilation variance. The
-plain-decode baseline reproduced to 0.08% across three independent runs. The
-measurement was precise and wrong.
+#### Two things only measurement shows
 
-What caught it was the physical monotonicity check, which encodes something the
-timer cannot know: more speculation depth is strictly more work.
+**Vanilla speculative decoding is a net loss in this regime.** 1.021x at k=4 --
+barely break-even -- falling below 1.0 from k=5 and reaching 0.815x at k=8. The
+cost model predicts 1.36x. At B=64, L=512 the dense draft's KV reads cost more
+than its acceptance buys, and no analytical term in the model captures it.
 
-**The replacement** differences against a *zero-round* program instead of a
-shorter one. A zero-round program has no round code for a compiler to treat
-differently; what remains is exactly the prefill, which is the part that must
-cancel. `(t_R - t_0) / R` is R rounds of one program measured against itself. The
-plain baseline gets the same treatment against a one-token run.
+**k=4 is not the optimum for any of the three.** SPIRe peaks at k=5 (2.162x),
+MagicDec at k=7 (1.586x), vanilla at k=2 (1.091x). The paper evaluates
+everything at k=4. Combined with the acceptance sweep, deeper speculation is
+worth more to the larger draft on both sides of the ratio.
 
-### Sparse drafts are no longer blocked
+#### On the validation gate
 
-The compact ring buffer is built (fidelity-ledger 2.5, 10.1). The draft now holds
-`sink + window + k` entries physically rather than masking a full-length cache, so
-its memory traffic stops growing with L -- 69 entries against a target's 768 at
-L=512, and constant as L grows. `tests/test_ring_buffer.py` proves the compact and
-full-masked paths give **bitwise identical** draft distributions across every
-round, for SPIRe and for MagicDec under both RoPE conventions.
+All three modes print `DISAGREE`, on the τ cross-check alone. It is a sampling
+artifact and it is understood: the timing harness measures τ on one batch of 64
+contexts while the reference averages 600. Re-running the acceptance harness on
+that *same batch* gives 2.322 / 3.456 / 2.846 against the timing run's 2.414 /
+3.546 / 2.960 -- agreement to 2.6-4.0%, the residual being the fixed-round versus
+G=64 stopping rule. That batch is simply harder than the split average, uniformly
+across all three methods.
 
-That removed the blocker: all three models can now be timed on the same footing,
-which is what the rerun is doing.
+It does not touch the ITM column: `ITM = τ_obs / speedup` while
+`speedup = t_plain / (t_round/τ_obs)`, so **τ cancels** and measured ITM is a pure
+timing ratio.
 
 ### 5. The paper's dataset source no longer exists
 

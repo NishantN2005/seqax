@@ -592,3 +592,48 @@ zero across the paper's entire operating region.
 `tests/test_cost_model.py` asserts both halves — that the term is inert at the
 headline cell, and that it still bites when compute-bound, so the first assertion
 cannot pass by the term simply being absent.
+
+### 10.4 The timing harness was measuring the compiler, not the model
+
+`spec_generate` read `return jax.jit(fn)(...)` inside its call body, constructing
+a fresh `shard_map` and a fresh `jit` wrapper on every invocation. JAX keys its
+compilation cache on that wrapper, so a new one per call missed the cache and
+**recompiled the entire program every time**.
+
+A speculative call cost 7-22 seconds against plain decode's 54 ms. That was
+compile time. `decode.py` had it right from the start with `@jax.jit` applied as
+a decorator at construction; the speculative path used a manual `shard_map`
+because its return arity varies with `return_drafts`, and the jit went inside the
+call along with it.
+
+It explains a set of symptoms that made no sense individually:
+
+| symptom | why |
+|---|---|
+| cost flat in the round count (R=2 at 22.5s, R=38 at 17.1s) | compile time barely depends on it |
+| ±30% between otherwise identical runs | compile-time variance |
+| a 16.5s fixed cost on a 0.7s round signal | the constant *was* the compile |
+| plain decode fine at 54 ms, 0.1% jitter | jitted once |
+
+After the fix, a zero-round speculative call costs **53-54 ms in all three modes**
+against plain prefill's 53.7 ms, and per-round costs order as physics requires:
+SPIRe cheapest at ~15 ms (2 layers over a 69-entry cache), MagicDec ~18 ms (the
+8-layer target, sparse cache), vanilla ~21 ms (4-layer draft reading all 768).
+
+**Three earlier fixes preceded this one and none of them was the cause** --
+cross-compilation differencing, per-row RoPE on a dense cache, and unstacked
+per-round distributions. All three were real defects worth fixing. None could
+have produced sane numbers, because the harness was timing its compiler
+throughout.
+
+The method failure is worth recording separately: each of those was diagnosed by
+reasoning about a *differenced* quantity that had several faults compounded into
+it. What finally worked was timing the components directly -- prefill, and
+t(R) at R = 0, 4, 12, 38 -- which took twenty minutes and was available from the
+first non-monotonic result. **When a derived number is inexplicable, measure its
+parts before theorising about its whole.**
+
+Also affects `tau.py`, which calls the generator once per batch and so recompiled
+per batch. The τ *values* are unaffected -- correctness never depended on this --
+but every acceptance run in this project before 2026-09-09 was far slower than it
+needed to be.
