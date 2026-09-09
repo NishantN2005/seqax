@@ -263,14 +263,19 @@ def main() -> None:
         # differencing them does not cancel what it looks like it cancels. A
         # zero-token program contains no decode steps at all, so the difference
         # is exactly G steps of the G-token program.
+        # G=1, not G=0: make_generate samples its first token from the prefill
+        # and then scans G-1 more, so G=0 would ask for arange(-1). G=1 is the
+        # same thing the zero-round speculative baseline is -- prefill plus the
+        # setup, and ZERO iterations of the loop whose cost we are after -- so
+        # the difference is G2-1 iterations of one program.
         with shardtypes.Scope():
-            g0f = make_generate(h_t, L, 0, 0.0, klen=klen)
+            g0f = make_generate(h_t, L, 1, 0.0, klen=klen)
             t0, j0 = timeit(lambda: g0f(w_t, prompt, rng), args.reps)
         with shardtypes.Scope():
             g2f = make_generate(h_t, L, G2, 0.0, klen=klen)
             t2, j2 = timeit(lambda: g2f(w_t, prompt, rng), args.reps)
         j1 = j0
-        tpt_plain = (t2 - t0) / G2
+        tpt_plain = (t2 - t0) / (G2 - 1)
         print(f"plain decode: {tpt_plain * 1e3:.4f} ms/token  (jitter {max(j1, j2):.1%})")
         if max(j1, j2) > args.max_jitter or tpt_plain <= 0:
             raise SystemExit(f"baseline unusable: jitter {max(j1, j2):.1%}, tpt {tpt_plain:.2e}")
