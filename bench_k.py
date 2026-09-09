@@ -257,13 +257,20 @@ def main() -> None:
         print(f"\nKlen PINNED to {klen} for every timed configuration\n")
 
         # ---- Baseline: plain target decoding, same pinned Klen ----
+        # The baseline is differenced against a ZERO-TOKEN run, not a shorter
+        # one. See the note on the speculative timings below: two programs
+        # compiled for different loop counts are not on a common scale, so
+        # differencing them does not cancel what it looks like it cancels. A
+        # zero-token program contains no decode steps at all, so the difference
+        # is exactly G steps of the G-token program.
         with shardtypes.Scope():
-            g1f = make_generate(h_t, L, G1, 0.0, klen=klen)
-            t1, j1 = timeit(lambda: g1f(w_t, prompt, rng), args.reps)
+            g0f = make_generate(h_t, L, 0, 0.0, klen=klen)
+            t0, j0 = timeit(lambda: g0f(w_t, prompt, rng), args.reps)
         with shardtypes.Scope():
             g2f = make_generate(h_t, L, G2, 0.0, klen=klen)
             t2, j2 = timeit(lambda: g2f(w_t, prompt, rng), args.reps)
-        tpt_plain = (t2 - t1) / (G2 - G1)
+        j1 = j0
+        tpt_plain = (t2 - t0) / G2
         print(f"plain decode: {tpt_plain * 1e3:.4f} ms/token  (jitter {max(j1, j2):.1%})")
         if max(j1, j2) > args.max_jitter or tpt_plain <= 0:
             raise SystemExit(f"baseline unusable: jitter {max(j1, j2):.1%}, tpt {tpt_plain:.2e}")
@@ -273,29 +280,44 @@ def main() -> None:
               f"{'ms/tok':>8} {'speedup':>8} {'ITM_meas':>9} {'ITM_pred':>9} {'ITM_pr+':>8} "
               f"{'jit':>5}")
         print("-" * 105)
+        # Why the round count is differenced against ZERO and not against a
+        # shorter run.
+        #
+        # num_rounds is a STATIC argument: every (k, rounds) pair is its own XLA
+        # compilation, with its own fusion and scheduling decisions. Two such
+        # programs are each internally stable -- jitter here ran 1-5% -- but they
+        # are not on a common scale, so (t_long - t_short) does not isolate the
+        # extra rounds. The previous version differenced a 5-round program
+        # against a 21-round one and got a per-round cost of 48ms at k=4 and 17ms
+        # at k=5 for the same model, which is impossible: depth 5 runs strictly
+        # more draft passes than depth 4. The measurement was reading the gap
+        # between two compilers' decisions, not the cost of speculation.
+        #
+        # A zero-round program has no round code to compile differently. What is
+        # left in it is exactly the prefill -- both caches filled over the prompt,
+        # the first token sampled -- which is the part that must cancel. So
+        # (t_R - t_0) / R is R rounds of ONE program, measured against itself.
         for k in ks:
-            r1, r2 = rounds[k]
+            R = rounds[k][1]
             try:
                 with shardtypes.Scope():
-                    s1 = make_speculative_generate(
-                        h_t, h_d, L, r1, k, 0.0, klen=klen,
+                    s0 = make_speculative_generate(
+                        h_t, h_d, L, 0, k, 0.0, klen=klen,
                         draft_sink=args.sink, draft_window=d_window,
                         draft_prefill_dense=prefill_dense, magicdec_rope=mdrope,
                         compact_draft_cache=True)
-                    o1 = jax.block_until_ready(s1(w_t, w_d, prompt, rng))
-                    n1 = float(np.mean(np.asarray(o1[1])))
-                    n1max = float(np.max(np.asarray(o1[1])))
-                    ts1, js1 = timeit(lambda: s1(w_t, w_d, prompt, rng), args.reps)
+                    jax.block_until_ready(s0(w_t, w_d, prompt, rng))
+                    ts0, js0 = timeit(lambda: s0(w_t, w_d, prompt, rng), args.reps)
                 with shardtypes.Scope():
-                    s2 = make_speculative_generate(
-                        h_t, h_d, L, r2, k, 0.0, klen=klen,
+                    sN = make_speculative_generate(
+                        h_t, h_d, L, R, k, 0.0, klen=klen,
                         draft_sink=args.sink, draft_window=d_window,
                         draft_prefill_dense=prefill_dense, magicdec_rope=mdrope,
                         compact_draft_cache=True)
-                    o2 = jax.block_until_ready(s2(w_t, w_d, prompt, rng))
-                    n2 = float(np.mean(np.asarray(o2[1])))
-                    n2max = float(np.max(np.asarray(o2[1])))
-                    ts2, js2 = timeit(lambda: s2(w_t, w_d, prompt, rng), args.reps)
+                    oN = jax.block_until_ready(sN(w_t, w_d, prompt, rng))
+                    nN = float(np.mean(np.asarray(oN[1])))
+                    nNmax = float(np.max(np.asarray(oN[1])))
+                    tsN, jsN = timeit(lambda: sN(w_t, w_d, prompt, rng), args.reps)
             except Exception as e:  # noqa: BLE001
                 print(f"{k:>3}   FAILED: {type(e).__name__}: {e}")
                 rows.append({"k": k, "failed": f"{type(e).__name__}"})
@@ -305,24 +327,24 @@ def main() -> None:
             # out-of-bounds cache write does not raise -- dynamic_update_slice
             # CLAMPS -- so an overrun corrupts the cache silently and still
             # produces a plausible timing. Check the longest row, not the mean.
-            need = L + 1 + int(max(n1max, n2max)) + k + 1
+            need = L + 1 + int(nNmax) + k + 1
             if need > klen:
                 print(f"{k:>3}   REJECTED: overran Klen ({need} > {klen}); "
                       f"raise the headroom above 25%")
                 rows.append({"k": k, "rejected": f"overran klen {need}>{klen}"})
                 continue
 
-            jit = max(js1, js2)
-            dtok = n2 - n1
-            if dtok <= 0 or ts2 <= ts1 or jit > args.max_jitter:
-                why = "neg slope" if (dtok <= 0 or ts2 <= ts1) else f"jitter {jit:.0%}"
+            jit = max(js0, jsN)
+            if nN <= 0 or tsN <= ts0 or jit > args.max_jitter:
+                why = "neg slope" if (nN <= 0 or tsN <= ts0) else f"jitter {jit:.0%}"
                 print(f"{k:>3}   REJECTED: {why}")
                 rows.append({"k": k, "rejected": why})
                 continue
 
-            tpt_spec = (ts2 - ts1) / dtok
+            t_round = (tsN - ts0) / R            # one program, measured against itself
+            tau_obs = nN / R                     # tokens per round, over the WHOLE run
+            tpt_spec = t_round / tau_obs
             speedup = tpt_plain / tpt_spec
-            tau_obs = dtok / (r2 - r1)           # tokens per round, from THIS run
             itm_meas = tau_obs / speedup          # speedup = tau / ITM, by definition
             itm_pred = calculate_itm(B, L, h_t, k, args.hoi, N_t, N_pred,
                                      kv_len_pred, h_pred, kvp_pred)
@@ -331,10 +353,10 @@ def main() -> None:
             itm_pred_c = calculate_itm(B, L, h_t, k, args.hoi, N_t, N_pred,
                                        kv_len_pred + (k if sparse_draft else 0),
                                        h_pred, kvp_pred)
-            print(f"{k:>3} {f'{r1}/{r2}':>11} {f'{n1:.0f}/{n2:.0f}':>13} {tau_obs:>8.3f} "
+            print(f"{k:>3} {R:>11} {nN:>13.0f} {tau_obs:>8.3f} "
                   f"{taus[k]:>8.3f} {tpt_spec * 1e3:>8.4f} {speedup:>8.3f} "
                   f"{itm_meas:>9.3f} {itm_pred:>9.3f} {itm_pred_c:>8.3f} {jit:>5.0%}")
-            rows.append({"k": k, "rounds": [r1, r2], "tokens": [n1, n2], "tau_observed": tau_obs,
+            rows.append({"k": k, "rounds": R, "tokens": nN, "tau_observed": tau_obs,
                          "tau_reference": taus[k], "tpt_spec_s": tpt_spec, "tpt_plain_s": tpt_plain,
                          "speedup": speedup, "itm_measured": itm_meas, "itm_predicted": itm_pred,
                          "itm_predicted_corrected": itm_pred_c,
@@ -346,7 +368,7 @@ def main() -> None:
         # The strongest check available: tau derived from the TIMING run must match
         # the tau measured independently by tau.py. If these disagree, the two
         # harnesses are not describing the same computation and nothing else holds.
-        toks = [r["tokens"][1] for r in ok]
+        toks = [r["tokens"] for r in ok]
         spread = (max(toks) - min(toks)) / np.mean(toks)
         print(f"  token-range match across depths: {min(toks):.0f}-{max(toks):.0f} "
               f"(spread {spread:.1%}) -- unequal ranges are what made ITM non-monotonic")
