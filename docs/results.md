@@ -132,6 +132,52 @@ the size of the effect it claims.
 
 ---
 
+## τ vs speculation depth, all three models (objective #2)
+
+L=512, T=1.0, 600 contexts, G=64. The paper reports k=4 only.
+
+| | k=1 | 2 | 3 | **4** | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|---|
+| MagicDec | 1.853 | 2.560 | 3.156 | **3.688** | 4.095 | 4.490 | 4.788 | 5.119 |
+| SPIRe | 1.761 | 2.346 | 2.776 | **3.136** | 3.407 | 3.594 | 3.744 | 3.858 |
+| Vanilla | 1.659 | 2.092 | 2.382 | **2.581** | 2.708 | 2.798 | 2.859 | 2.951 |
+
+**k=4 is the depth at which these three methods look most alike.** They saturate
+at very different rates, and the paper evaluates all of them at the one depth
+where that difference is least visible:
+
+| | k=4 → k=8 | marginal gain at k=8 |
+|---|---|---|
+| MagicDec | +39% | **+0.331** |
+| SPIRe | +23% | +0.114 |
+| Vanilla | +14% | +0.092 |
+
+At k=8 MagicDec is still gaining **3× faster** than either small draft and has
+clearly not saturated. Its draft *is* the target, so acceptance survives deep into
+a round; the small drafts are simply not reached that far.
+
+The consequence for the paper's framing: **MagicDec's lead over SPIRe more than
+doubles**, +0.552 at k=4 to +1.261 at k=8, while SPIRe's lead over vanilla grows
+much less, +0.555 to +0.907. Read at k=4 the two gaps are nearly identical (0.552
+vs 0.555); read at k=8 they are not close.
+
+Efficiency, τ/(k+1) -- the fraction of each round's capacity actually used:
+
+| | k=1 | k=4 | k=8 |
+|---|---|---|---|
+| MagicDec | 0.926 | 0.738 | 0.569 |
+| SPIRe | 0.880 | 0.627 | 0.429 |
+| Vanilla | 0.830 | 0.516 | 0.328 |
+
+All three decay, but at k=8 vanilla wastes two thirds of every round while
+MagicDec still uses over half. That ordering is stable across the whole sweep,
+and it is what makes deep speculation worth more to a large draft -- the trade
+the cost model has to price, since a bigger draft costs more per token drafted.
+
+τ here is measured under the same G=64 rule as Table 1, so these numbers are
+directly comparable to it: the k=4 column reproduces the Table 1 row to within
+measurement noise.
+
 ## What the memory pathway is worth, measured
 
 All four numbers below come from the same harness, so they are directly
@@ -383,11 +429,16 @@ compounding Finding 7.
 
 ### 10. Measured ITM exceeds the cost model by ~2x, and the cause is not simple overhead
 
+> **WITHDRAWN 2026-09-08.** Every ITM number in this section was produced by
+> differencing two generation lengths, and that method is invalid here. See
+> "Why these numbers are withdrawn" at the end of the section. The measurement is
+> being redone; the qualitative claim (measured cost exceeds the model) is *not*
+> currently supported by anything published here.
+
 **First end-to-end timing of the paper's cost model** (objective #1). Vanilla
-speculative decoding, H100 PCIe, HOI=756, k=4. ITM is measured as a SLOPE between
-two generation lengths (G=32 vs 160, 7 reps), which cancels prefill and compile
-cost exactly; cells whose inter-quartile jitter exceeds 10% are rejected rather
-than reported.
+speculative decoding, H100 PCIe, HOI=756, k=4. ITM was measured as a SLOPE between
+two generation lengths (G=32 vs 160, 7 reps), intended to cancel prefill and
+compile cost; cells whose inter-quartile jitter exceeded 10% were rejected.
 
 | B | L | t_step (ms) | t_round (ms) | ITM meas | ITM pred | err |
 |---|---|---|---|---|---|---|
@@ -421,10 +472,52 @@ rather than a compact cache, no fused kernels, a 67M model. A production serving
 stack sits far closer to roofline. The defensible claim is "the model omits costs
 that dominate at these scales," not "the model is wrong."
 
-Not measured: sparse drafts. SPIRe's and MagicDec's entire cost argument is that
-the draft does not carry the KV cache, and ours is a mask, so the draft still reads
-full Klen from HBM. Timing those would measure our implementation, not the method.
-The compact ring buffer remains the blocker (fidelity-ledger 2.5).
+### Why these numbers are withdrawn
+
+The slope differenced two generation lengths to cancel prefill:
+
+```
+t(long)  = prefill + R_long  x per_round
+t(short) = prefill + R_short x per_round
+```
+
+`num_rounds` is a **static** argument to `make_speculative_generate`: it fixes the
+length of a `lax.scan`, so each round count is a *separate XLA compilation* with
+its own fusion and scheduling. The two lines above are therefore not the same
+`prefill` and the same `per_round`, and subtracting them leaves the quantity of
+interest plus a contamination term that is pure compiler difference.
+
+It is not a small effect. On the three-model rerun, vanilla measured **3.2x
+cheaper per token at k=5 than at k=4** -- impossible, since depth 5 runs strictly
+more draft passes. SPIRe inverted between k=3 and k=4 the same way. All three
+modes failed the monotonicity gate.
+
+It was invisible to the jitter check by construction: `timeit` measures one
+compiled program repeatedly, so it captures run-to-run variance (1-5%, well inside
+threshold) and is structurally blind to compilation-to-compilation variance. The
+plain-decode baseline reproduced to 0.08% across three independent runs. The
+measurement was precise and wrong.
+
+What caught it was the physical monotonicity check, which encodes something the
+timer cannot know: more speculation depth is strictly more work.
+
+**The replacement** differences against a *zero-round* program instead of a
+shorter one. A zero-round program has no round code for a compiler to treat
+differently; what remains is exactly the prefill, which is the part that must
+cancel. `(t_R - t_0) / R` is R rounds of one program measured against itself. The
+plain baseline gets the same treatment against a one-token run.
+
+### Sparse drafts are no longer blocked
+
+The compact ring buffer is built (fidelity-ledger 2.5, 10.1). The draft now holds
+`sink + window + k` entries physically rather than masking a full-length cache, so
+its memory traffic stops growing with L -- 69 entries against a target's 768 at
+L=512, and constant as L grows. `tests/test_ring_buffer.py` proves the compact and
+full-masked paths give **bitwise identical** draft distributions across every
+round, for SPIRe and for MagicDec under both RoPE conventions.
+
+That removed the blocker: all three models can now be timed on the same footing,
+which is what the rerun is doing.
 
 ### 5. The paper's dataset source no longer exists
 
