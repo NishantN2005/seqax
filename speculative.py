@@ -124,7 +124,11 @@ def make_speculative_generate(
     assert h_target.vocab == h_draft.vocab, "draft and target must share a vocabulary"
     assert not (magicdec_rope and draft_window is None), "magicdec_rope requires a draft_window"
     Pn, R, V = prompt_len, num_rounds, h_target.vocab
-    S = 1 + R * (k + 1)  # output buffer length (upper bound on tokens generated)
+    # max(R, 1), not R: lax.scan TRACES its body even when it will run zero
+    # iterations, and that body writes k+1 tokens into this buffer. A zero-round
+    # generator is used as a prefill-only timing baseline -- its output is never
+    # read -- but it still has to be traceable, so the buffer must hold one round.
+    S = 1 + max(R, 1) * (k + 1)  # output buffer length (upper bound on tokens generated)
     # BOS convention, same as decode.make_generate: the model reads ids[i] as the
     # token BEFORE position i, so both caches are prefilled with [BOS, prompt...]
     # and every absolute position is one greater than the prompt index it carries.
