@@ -520,13 +520,18 @@ def make_speculative_generate(
             d_last = jnp.take_along_axis(d_toks, jnp.maximum(n_acc - 1, 0)[:, None], axis=1)[:, 0]
             prev_tok = jnp.where(n_acc > 0, d_last, cur_tok)
             pos = pos + n_acc + 1
-            return (t_cache, d_cache, d_pos, final_tok, prev_tok, pos, out), (n_acc, d_toks, q_dists)
+            # q_dists is [B, k, V] -- 100MB at B=64, k=8 -- and stacking it over
+            # every round costs GBs that only the ring-buffer test ever reads. A
+            # real decoder never materialises it, so leaving it in inflated the
+            # measured round cost as well as the compile time.
+            per_round = (n_acc, d_toks, q_dists) if return_drafts else (n_acc, d_toks)
+            return (t_cache, d_cache, d_pos, final_tok, prev_tok, pos, out), per_round
 
         # `first_drafts` exposes round 0's k proposals so a test can compare the
         # cached decode path against a no-cache forward pass built from TRAINING
         # semantics. Without it the only observable is the committed stream, which
         # the target's accept/reject decisions confound.
-        (_, _, _, _, _, pos, out), (n_accepted, all_drafts, all_qs) = jax.lax.scan(
+        (_, _, _, _, _, pos, out), scanned = jax.lax.scan(
             round_body,
             # cur_tok sits at absolute position Pf (BOS occupies 0, prompt 1..Pn);
             # prev_tok is the token at Pf-1, i.e. the last real prompt token.
@@ -534,6 +539,10 @@ def make_speculative_generate(
              jnp.full((lb,), Pf, jnp.int32), out),
             jnp.arange(R, dtype=jnp.int32),
         )
+        if return_drafts:
+            n_accepted, all_drafts, all_qs = scanned
+        else:
+            n_accepted, all_drafts = scanned
         if return_drafts:
             # The DISTRIBUTIONS, not just the sampled tokens. With an untrained
             # draft the logits are near-uniform, so an argmax is decided by noise
