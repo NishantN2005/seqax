@@ -493,10 +493,48 @@ barely break-even -- falling below 1.0 from k=5 and reaching 0.815x at k=8. The
 cost model predicts 1.36x. At B=64, L=512 the dense draft's KV reads cost more
 than its acceptance buys, and no analytical term in the model captures it.
 
-**k=4 is not the optimum for any of the three.** SPIRe peaks at k=5 (2.162x),
-MagicDec at k=7 (1.586x), vanilla at k=2 (1.091x). The paper evaluates
-everything at k=4. Combined with the acceptance sweep, deeper speculation is
-worth more to the larger draft on both sides of the ratio.
+**Only the dense draft has a depth that matters.** Vanilla peaks sharply at
+k=2 (1.091x) and degrades hard past it, losing 25% by k=8 and falling below
+break-even from k=5. Both sparse methods are essentially flat from k=4 onward:
+SPIRe varies 3.9% over k=4..8 and MagicDec 1.7%, against ~1% timing jitter.
+
+> **Corrected 2026-09-15.** This previously read "k=4 is not the optimum for any
+> of the three -- SPIRe peaks at k=5, MagicDec at k=7." Those are the arithmetic
+> maxima, but MagicDec's curve varies 1.7% across k=4..8, which is barely above
+> jitter: naming a peak on it is reading a maximum off a flat line. That is the
+> same error that produced the withdrawn "τ is not constant in L" finding.
+> Vanilla's optimum IS well determined -- its curve varies 25.4% -- and the cost
+> model predicts it correctly at k=2.
+
+The useful statement is the asymmetry: **deep speculation is safe for a sparse
+draft and actively harmful for a dense one.** A dense draft re-reads the whole
+context on every one of its k passes, so each extra token of depth costs the
+full cache; a windowed draft pays a constant. That is the cost-side counterpart
+of the acceptance-side finding above, and it is the one direction the paper's
+single k=4 evaluation cannot show.
+
+#### Against the model's own predictions across k
+
+The paper publishes nothing at k != 4, so this compares measurement against what
+its cost model predicts at each depth -- curves the paper never plotted.
+
+| measured / predicted throughput | k=1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | drift |
+|---|---|---|---|---|---|---|---|---|---|
+| Vanilla | 0.75 | 0.77 | 0.77 | 0.77 | 0.78 | 0.79 | 0.80 | 0.80 | +6% |
+| MagicDec | 0.76 | 0.78 | 0.79 | 0.80 | 0.82 | 0.82 | 0.85 | 0.86 | +13% |
+| SPIRe | 0.87 | 0.86 | 0.84 | 0.81 | 0.81 | 0.80 | 0.80 | 0.79 | -10% |
+
+**This qualifies the "flat 25%" above.** The factor is uniform at k=4 --
+23.9% to 25.2% across three very different methods, which is why the ratios
+reproduce -- but across the whole sweep it drifts from 0.75 to 0.87, and it
+drifts in *opposite directions* for SPIRe versus the other two. The model grows
+steadily more pessimistic about the two drafts that re-read a large cache and
+less so about the one that does not. So the error is not a constant offset; it
+has structure in k, and the structure tracks cache traffic.
+
+Predicted optima, for the record: vanilla k=2 (matches measurement), SPIRe k=6
+(measured 5), MagicDec k=4 (measured 7) -- the latter two on curves too flat to
+separate.
 
 #### On the validation gate
 
