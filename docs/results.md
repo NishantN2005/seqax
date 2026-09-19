@@ -550,6 +550,100 @@ It does not touch the ITM column: `ITM = τ_obs / speedup` while
 `speedup = t_plain / (t_round/τ_obs)`, so **τ cancels** and measured ITM is a pure
 timing ratio.
 
+### 11. ITM falls with context for a sparse draft and not for a dense one
+
+**Objective #3, cost half.** The paper's central mechanism is that the target's
+KV cache grows with context while a windowed draft's does not, so a sparse draft
+should get cheaper *relative to the target* as L grows. It had never been
+measured. This needs no retraining: ITM is a timing ratio over fixed shapes, so
+it is valid at context lengths the target was never trained for.
+
+k=4, B=64, `klen` pinned per L and shared across modes, 5 rungs from L=512 to
+2560.
+
+| measured ITM | 512 | 960 | 1280 | 1920 | 2560 |
+|---|---|---|---|---|---|
+| Vanilla (dense draft) | 2.505 | 2.621 | 2.567 | 2.600 | **2.573** |
+| MagicDec (sparse) | 2.385 | 2.088 | 1.917 | 1.860 | — |
+| SPIRe (sparse) | 1.528 | 1.427 | 1.366 | 1.308 | **1.251** |
+
+| predicted ITM | 512 | 960 | 1280 | 1920 | 2560 |
+|---|---|---|---|---|---|
+| Vanilla | 1.944 | 1.969 | 1.976 | 1.984 | 1.988 |
+| MagicDec | 1.896 | 1.504 | 1.384 | 1.260 | — |
+| SPIRe | 1.224 | 1.126 | 1.096 | 1.065 | 1.049 |
+
+**The mechanism reproduces.** Vanilla is flat to 4% across a 5x context range --
+its draft re-reads a cache growing in lockstep with the target's, so the ratio is
+pinned, exactly as the control should behave. Both sparse drafts fall: SPIRe
+-18%, MagicDec -22% over the range each covers.
+
+#### What it is worth
+
+τ held at its L=512 value, which Table 1 licenses and our own reproduction
+confirmed flat in L to 1.1%:
+
+| throughput | 512 | 960 | 1280 | 1920 | 2560 |
+|---|---|---|---|---|---|
+| SPIRe | 2.052 | 2.198 | 2.296 | 2.398 | **2.507** |
+| MagicDec | 1.546 | 1.766 | 1.924 | 1.983 | — |
+| Vanilla | 1.030 | 0.985 | 1.005 | 0.993 | 1.003 |
+
+| SPIRe's margin | 512 | 960 | 1280 | 1920 | 2560 |
+|---|---|---|---|---|---|
+| over vanilla | 1.99x | 2.23x | 2.28x | 2.42x | **2.50x** |
+| over MagicDec | 1.33x | 1.24x | 1.19x | 1.21x | — |
+
+**The paper's +104% is a floor.** It is measured at L=512, the shortest context
+in its own grid, and the margin grows to **2.50x** by L=2560 -- half again as
+much over a 5x context increase. Vanilla, meanwhile, sits at break-even
+throughout: at B=64 a dense draft buys nothing at any context length tested.
+
+The counter-trend is equally real and the paper cannot see it: **SPIRe's lead
+over MagicDec shrinks**, 1.33x to 1.21x. MagicDec's draft is the full 8-layer
+target, so it has far more cache to save by going sparse. Whether the two cross
+is the open question, and the one cell needed to answer it (MagicDec at 2560) is
+the one that would not fit.
+
+#### A control that came free
+
+At L=512 this sweep used **synthetic prompts** -- the corpus was going to take
+~26 hours to transfer at the link speed available, and ITM cannot depend on
+prompt content. That reproduced the corpus-prompt run to within 1%:
+
+| L=512, k=4 | corpus prompts | synthetic | Δ |
+|---|---|---|---|
+| Vanilla | 2.529 | 2.505 | −0.9% |
+| MagicDec | 2.365 | 2.385 | +0.8% |
+| SPIRe | 1.509 | 1.528 | +1.3% |
+
+The τ column confirms the other half: vanilla read 1.776 against a true 2.581.
+Note the direction -- *low*, where the earlier synthetic-prompt failure (constant
+`jnp.ones` prompts, ledger §4) read *high*, 2.000 against 1.688. Uniform random
+tokens are maximally unpredictable; a constant prompt is trivially predictable.
+Both wrong, opposite directions, same cause: neither is text. τ and speedup are
+void under `--prompts random` and the harness prints a banner saying so.
+
+#### The ceiling, and three bugs behind it
+
+The ladder stops at 2560 (and MagicDec at 1920). Getting even that far took
+three attempts, and the first two diagnoses were wrong:
+
+1. **Blamed attention.** The byte count said otherwise: `64 x 2561 x 50304 x 4`
+   matches the reported 32,980,107,264 *exactly*. It was the **unembedding** --
+   both prefills projected every prompt position to vocabulary and then read
+   `logits[:, -1]`. 33 GB materialised to keep one column.
+2. **The chunking fix never ran.** `bench_k` builds three generators -- a
+   calibration probe plus two timed runs -- and the flag reached only the timed
+   pair. Byte-identical errors should have said so immediately.
+3. **Same bug, third site.** The real fix reuses `hidden_only`, added when this
+   exact mistake OOMed feedback-memory training at 117 GB. Prefill logits are now
+   12.9 MB rather than 33 GB, a 2560x reduction.
+
+What still caps it is the attention term in MagicDec's *dense* draft prefill --
+ledger §2.5's explicit-mask attention, not FlashAttention. Clearing it means
+FlashAttention or a smaller batch, and a smaller batch would confound B with L.
+
 ### 5. The paper's dataset source no longer exists
 
 `gs://longcrawl64` returns `NoSuchBucket` from every GCS endpoint. Work continues on

@@ -637,3 +637,41 @@ Also affects `tau.py`, which calls the generator once per batch and so recompile
 per batch. The τ *values* are unaffected -- correctness never depended on this --
 but every acceptance run in this project before 2026-09-09 was far slower than it
 needed to be.
+
+### 10.5 The shardtypes global-dimension trap, three times
+
+`shardlib` dimension names (`L`, `n_mem`, `layers`, `G`) are **process-global**.
+Any call that uses a different extent for one of them needs its own
+`with shardtypes.Scope():`, or the shape check fails against whatever is
+currently bound.
+
+It has now bitten three times, in three unrelated changes:
+
+| where | bound to | called with |
+|---|---|---|
+| `memory_to_kv` at decode | `L` = `Pf` | 1, and `k+1` |
+| test helpers for the decode oracle | `layers` = 4 (target) | 2 (draft) |
+| one-position projection at prefill | `L` = `Pf` | 1 |
+
+The third took seven test suites red to notice, which is the useful part: the
+failure is loud and immediate rather than silent. But the rule is worth stating
+once — **if a helper is called at a different length or depth than the pass
+around it, wrap it in a Scope** — because the natural instinct is to treat these
+annotations as local when they are not.
+
+### 10.6 The same OOM, in three places
+
+`forward_pass` projects every position to vocabulary. Three separate call sites
+computed `[B, L, V]` and then used a small slice of it:
+
+| site | what it kept | cost at its own scale |
+|---|---|---|
+| feedback-memory training loop | offset-j positions, 1 of k | 117 GB requested |
+| plain-decode prefill | `logits[:, -1]` | 33 GB at L=2560 |
+| speculative prefill | `logits[:, -1]` | 33 GB at L=2560 |
+
+All three are fixed by `hidden_only` plus `Model.unembed_hidden` on the slice
+actually wanted. The pattern to watch for: **a projection to vocabulary inside
+anything that runs over a whole sequence**, where only one position's
+distribution is read. At V=50304 the tensor is 200 KB per position per batch row,
+which is nothing at L=1 and 33 GB at L=2560.
