@@ -237,7 +237,7 @@ def make_speculative_generate(
 
     k_pos = jnp.arange(Klen)[jnp.newaxis, jnp.newaxis, :]
 
-    def target_forward(w, ids, pos, emit_acts: bool = False):
+    def target_forward(w, ids, pos, emit_acts: bool = False, last_logit_only: bool = False):
         """Target forward over ids[B, L] at per-row offsets pos[B]; dense causal.
 
         `emit_acts` returns per-layer activations as a 4th value, which is how the
@@ -249,14 +249,24 @@ def make_speculative_generate(
 
         def run(cache):
             with shardtypes.Scope():
-                return w.forward_pass(
-                    h_target, ids, mask, kv_cache=cache, kv_offset=pos, emit_activations=emit_acts
+                out = w.forward_pass(
+                    h_target, ids, mask, kv_cache=cache, kv_offset=pos,
+                    emit_activations=emit_acts, hidden_only=last_logit_only,
                 )
+                if not last_logit_only:
+                    return out
+                # Prefill reads logits[:, -1] and discards the rest, but computing
+                # them costs [B, Pf, V] -- 33 GB at B=64, L=2560, V=50304, which
+                # is what capped the context ladder at 1920. Project one position.
+                with shardtypes.Scope():   # L is bound to Pf here; this slice is 1
+                    last = w.unembed_hidden(out[0][:, -1:])
+                return (last,) + tuple(out[1:])
 
         return run
 
     def draft_forward(w, ids, pos, window, cache_relative_rope=False, memory=None,
-                      emit_acts: bool = False, slot_pos=None, dense_write: bool = False):
+                      emit_acts: bool = False, slot_pos=None, dense_write: bool = False,
+                      hidden_only: bool = False):
         """One draft pass. `slot_pos` [B, C_d] is the absolute position each cache
         slot holds, or -1 for empty.
 
@@ -325,7 +335,7 @@ def make_speculative_generate(
                     rope_q_positions=rope_q, rope_k_positions=rope_k,
                     rope_table_len=Klen,
                     memory=memory, w_memory=(w.w_memory if memory is not None else None),
-                    emit_activations=emit_acts,
+                    emit_activations=emit_acts, hidden_only=hidden_only,
                 )
 
         return run
@@ -352,8 +362,8 @@ def make_speculative_generate(
         if prefill_chunk and Pf > prefill_chunk:
             acc = []
             for c0 in range(0, Pf, prefill_chunk):
-                t_out = target_forward(w_t, ids0[:, c0 : c0 + prefill_chunk],
-                                       zero_pos + c0, emit_acts=use_mem)(t_cache)
+                t_out = target_forward(w_t, ids0[:, c0 : c0 + prefill_chunk], zero_pos + c0,
+                                       emit_acts=use_mem, last_logit_only=True)(t_cache)
                 t_logits, t_cache = t_out[0], t_out[1]
                 if use_mem:
                     acc.append(t_out[3])
@@ -363,7 +373,8 @@ def make_speculative_generate(
             if use_mem:
                 t_out = (t_logits, t_cache, t_out[2], jnp.concatenate(acc, axis=2))
         else:
-            t_out = target_forward(w_t, ids0, zero_pos, emit_acts=use_mem)(t_cache)
+            t_out = target_forward(w_t, ids0, zero_pos, emit_acts=use_mem,
+                                   last_logit_only=True)(t_cache)
             t_logits, t_cache = t_out[0], t_out[1]
         prefill_mem = None
         if use_mem:
@@ -418,10 +429,12 @@ def make_speculative_generate(
                     mem_c = None if prefill_mem is None else prefill_mem[:, :, c0 : c0 + prefill_chunk]
                     _, tmp, _ = draft_forward(
                         w_d, ids0[:, c0 : c0 + prefill_chunk], zero_pos + c0, d_prefill_window,
-                        memory=mem_c, slot_pos=tmp_pos, dense_write=True)(tmp)
+                        memory=mem_c, slot_pos=tmp_pos, dense_write=True,
+                        hidden_only=True)(tmp)
             else:
                 _, tmp, _ = draft_forward(w_d, ids0, zero_pos, d_prefill_window,
-                                          memory=prefill_mem, slot_pos=tmp_pos, dense_write=True)(tmp)
+                                          memory=prefill_mem, slot_pos=tmp_pos,
+                                          dense_write=True, hidden_only=True)(tmp)
             d_cache = tmp[:, :, :, jnp.asarray(_src_safe), :, :] if ring else tmp
 
         p0 = _dists(t_logits[:, -1], temperature)

@@ -115,9 +115,19 @@ def make_generate(h: ModelConfig, prompt_len: int, gen_len: int, temperature: fl
         q_pos = jnp.arange(Pf)[jnp.newaxis, :, jnp.newaxis]  # absolute positions 0..Pf-1
         prefill_mask = jnp.broadcast_to(streaming_visibility(q_pos, k_pos, sink_size, window), (lb, Pf, Klen))
         with shardtypes.Scope():
-            logits, cache, _ = w.forward_pass(
-                h, ids, prefill_mask, kv_cache=cache, kv_offset=jnp.zeros((lb,), jnp.int32)
+            # hidden_only, then project ONE position. Prefill reads logits[:, -1]
+            # and nothing else, but projecting every position costs [B, Pf, V] --
+            # 33 GB at B=64, L=2560, V=50304, which is what capped the context
+            # ladder. Projecting just the last is 12.9 MB.
+            hidden, cache, _ = w.forward_pass(
+                h, ids, prefill_mask, kv_cache=cache,
+                kv_offset=jnp.zeros((lb,), jnp.int32), hidden_only=True
             )
+            # Own Scope: shardlib dimension names are process-global, and L is
+            # already bound to Pf by the pass above. Projecting one position
+            # rebinds it to 1.
+            with shardtypes.Scope():
+                logits = w.unembed_hidden(hidden[:, -1:])
         tok = _sample(logits[:, -1], rng, jnp.uint32(0), temperature)  # [lb]
 
         # ---- Decode loop: token at absolute position pos is written to the
