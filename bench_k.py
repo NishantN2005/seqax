@@ -109,6 +109,14 @@ def main() -> None:
     p.add_argument("--max-jitter", type=float, default=0.10)
     p.add_argument("--hoi", type=float, default=HOI_H100_PCIE)
     p.add_argument("--out", default=None)
+    p.add_argument("--prompts", choices=["dataset", "random"], default="dataset",
+                   help="'random' skips the corpus entirely. Legitimate ONLY for a pure ITM "
+                        "measurement: ITM = t_round / t_plain is a timing ratio over fixed "
+                        "shapes, and per-round cost does not depend on how far the cursor has "
+                        "advanced because attention reads the whole pinned allocation either "
+                        "way. It DOES inflate tau -- synthetic prompts gave tau 2.000 against "
+                        "1.688 on real text at k=1 -- so the speedup and tau columns are void "
+                        "under it and are labelled as such.")
     p.add_argument("--temperature", type=float, default=1.0,
                    help="must match the temperature the reference taus were measured at. The "
                         "cross-check compares against tau.py, which reports T=1.0; timing at "
@@ -213,7 +221,11 @@ def main() -> None:
         # cross-check below only caught it because the two harnesses now share this
         # source; with synthetic prompts here it would have been comparing against a
         # tau that no longer described the run.
-        prompt = next(dataset_prompts(cfg, L, B, 1))
+        if args.prompts == "random":
+            prompt = jax.random.randint(jax.random.PRNGKey(0), (B, L), 1, h_t.vocab).astype(jnp.uint32)
+            print("PROMPTS: synthetic. ITM is valid; tau and speedup columns are NOT.")
+        else:
+            prompt = next(dataset_prompts(cfg, L, B, 1))
         rng = jnp.array([0, 0], jnp.uint32)
 
         # ---- Calibration pass: one short run per depth to measure the real tau ----
