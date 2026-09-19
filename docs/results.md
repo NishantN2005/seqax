@@ -573,7 +573,8 @@ k=4, B=64, `klen` pinned per L and shared across modes, 5 rungs from L=512 to
 | MagicDec | 1.896 | 1.504 | 1.384 | 1.260 | — |
 | SPIRe | 1.224 | 1.126 | 1.096 | 1.065 | 1.049 |
 
-**The mechanism reproduces.** Vanilla is flat to 4% across a 5x context range --
+**The mechanism reproduces.** Vanilla varies by 4.6% across a 5x context
+range with no trend in it (endpoints +2.7%) --
 its draft re-reads a cache growing in lockstep with the target's, so the ratio is
 pinned, exactly as the control should behave. Both sparse drafts fall: SPIRe
 -18%, MagicDec -22% over the range each covers.

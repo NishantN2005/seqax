@@ -1,0 +1,1072 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1"><style>:root{color-scheme:light}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>Measuring SPIRe</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;0,8..60,700;1,8..60,400&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+
+<style>
+:root {
+  --ground:      #FCFCFD;
+  --surface:     #F4F6F8;
+  --ink:         #14181F;
+  --ink-soft:    #3A424E;
+  --muted:       #6B7684;
+  --rule:        #DCE1E7;
+  --rule-strong: #B9C2CC;
+  --measured:    #0E6E63;
+  --measured-bg: #E4F1EF;
+  --predicted:   #9A5B14;
+  --predicted-bg:#F7EDDF;
+  --negative:    #8A3A46;
+  --negative-bg: #F7E7E9;
+  --ref:         #545F6E;
+
+  /* categorical series, validated: light steps pass all six checks against
+     surface #FCFCFD (worst adjacent CVD dE 20.6, normal-vision dE 24.6) */
+  --s-magicdec: #1B6CA8;
+  --s-spire:    #C25E1A;
+  --s-vanilla:  #6B4C9A;
+  --grid:       #E7EBEF;
+
+  --serif: "Source Serif 4", Charter, "Bitstream Charter", Georgia, serif;
+  --mono:  "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --sans:  "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+
+  --measure: 68ch;
+  --rail: 4.5rem;
+}
+
+:root:not([data-theme="light"]) {
+  @media (prefers-color-scheme: dark) {
+    --ground:      #0E1116;
+    --surface:     #161B22;
+    --ink:         #E4E8ED;
+    --ink-soft:    #BFC7D1;
+    --muted:       #8A94A2;
+    --rule:        #262D36;
+    --rule-strong: #3A434E;
+    --measured:    #4FC7B4;
+    --measured-bg: #10322E;
+    --predicted:   #E0A45C;
+    --predicted-bg:#33260F;
+    --negative:    #E08A96;
+    --negative-bg: #331A1E;
+    --ref:         #97A1AE;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    /* dark steps re-stepped into the dark band L 0.48-0.67, revalidated */
+    --s-magicdec: #3D8FD1;
+    --s-spire:    #D2762F;
+    --s-vanilla:  #8E70C8;
+    --grid:       #20262E;
+    --ground:      #0E1116;
+    --surface:     #161B22;
+    --ink:         #E4E8ED;
+    --ink-soft:    #BFC7D1;
+    --muted:       #8A94A2;
+    --rule:        #262D36;
+    --rule-strong: #3A434E;
+    --measured:    #4FC7B4;
+    --measured-bg: #10322E;
+    --predicted:   #E0A45C;
+    --predicted-bg:#33260F;
+    --negative:    #E08A96;
+    --negative-bg: #331A1E;
+    --ref:         #97A1AE;
+  }
+}
+
+:root[data-theme="dark"] {
+  --s-magicdec: #3D8FD1;
+  --s-spire:    #D2762F;
+  --s-vanilla:  #8E70C8;
+  --grid:       #20262E;
+  --ground:      #0E1116;
+  --surface:     #161B22;
+  --ink:         #E4E8ED;
+  --ink-soft:    #BFC7D1;
+  --muted:       #8A94A2;
+  --rule:        #262D36;
+  --rule-strong: #3A434E;
+  --measured:    #4FC7B4;
+  --measured-bg: #10322E;
+  --predicted:   #E0A45C;
+  --predicted-bg:#33260F;
+  --negative:    #E08A96;
+  --negative-bg: #331A1E;
+  --ref:         #97A1AE;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: 17px;
+  line-height: 1.62;
+  margin: 0;
+  padding: 0 1.5rem 6rem;
+  -webkit-font-smoothing: antialiased;
+}
+
+.wrap { max-width: calc(var(--measure) + var(--rail)); margin: 0 auto; }
+
+/* ---- masthead ---- */
+header.paper {
+  padding: 4rem 0 2rem;
+  margin-left: var(--rail);
+  border-bottom: 1px solid var(--rule-strong);
+}
+@media (max-width: 720px) { header.paper { margin-left: 0; } }
+
+.eyebrow {
+  font-family: var(--sans);
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 0 0 1.1rem;
+}
+
+h1 {
+  font-family: var(--serif);
+  font-size: clamp(2.1rem, 5vw, 3rem);
+  font-weight: 700;
+  line-height: 1.1;
+  letter-spacing: -0.018em;
+  margin: 0 0 0.5rem;
+  text-wrap: balance;
+}
+
+.subtitle {
+  font-size: 1.12rem;
+  color: var(--ink-soft);
+  font-style: italic;
+  margin: 0 0 1.8rem;
+  max-width: 54ch;
+  text-wrap: balance;
+}
+
+.byline {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  color: var(--muted);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1.4rem;
+}
+
+/* ---- abstract ---- */
+.abstract {
+  margin: 2.5rem 0 0 var(--rail);
+  padding: 1.4rem 1.6rem;
+  background: var(--surface);
+  border-left: 2px solid var(--measured);
+}
+@media (max-width: 720px) { .abstract { margin-left: 0; } }
+.abstract p { margin: 0 0 0.9rem; font-size: 0.96rem; }
+.abstract p:last-child { margin-bottom: 0; }
+.abstract .lbl {
+  font-family: var(--sans); font-size: 0.68rem; font-weight: 600;
+  letter-spacing: 0.13em; text-transform: uppercase; color: var(--muted);
+  display: block; margin-bottom: 0.7rem;
+}
+
+/* ---- sections with numbered rail ---- */
+section { margin-top: 3.4rem; position: relative; }
+section > * { margin-left: var(--rail); }
+@media (max-width: 720px) { section > * { margin-left: 0; } }
+
+.secno {
+  position: absolute;
+  left: 0; top: 0.35rem;
+  width: 3.2rem;
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  font-weight: 500;
+  color: var(--muted);
+  margin-left: 0 !important;
+  font-variant-numeric: tabular-nums;
+}
+@media (max-width: 720px) { .secno { position: static; display: block; margin-bottom: 0.35rem; } }
+
+h2 {
+  font-size: 1.42rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+  margin: 0 0 1rem;
+  text-wrap: balance;
+}
+
+h3 {
+  font-family: var(--sans);
+  font-size: 0.82rem;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+  margin: 2rem 0 0.7rem;
+}
+
+p { margin: 0 0 1.05rem; max-width: var(--measure); }
+
+code, .m { font-family: var(--mono); font-size: 0.88em; font-variant-numeric: tabular-nums; }
+code { background: var(--surface); padding: 0.1em 0.35em; border-radius: 2px; }
+.codeblock {
+  margin: 1.1rem 0 1.1rem var(--rail);
+  padding: 0.85rem 1.1rem;
+  background: var(--surface);
+  border-left: 2px solid var(--rule);
+  max-width: 62ch;
+  overflow-x: auto;
+}
+@media (max-width: 720px) { .codeblock { margin-left: 0; } }
+.codeblock pre {
+  margin: 0; font-family: var(--mono); font-size: 0.84rem;
+  line-height: 1.55; color: var(--ink-soft); white-space: pre;
+}
+
+strong { font-weight: 600; }
+em { font-style: italic; }
+
+/* ---- status chips ---- */
+.chip {
+  display: inline-block;
+  font-family: var(--sans);
+  font-size: 0.63rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 0.22em 0.6em;
+  border-radius: 2px;
+  vertical-align: 0.28em;
+  margin-left: 0.6rem;
+  white-space: nowrap;
+}
+.chip.confirmed  { background: var(--measured-bg);  color: var(--measured); }
+.chip.corrected  { background: var(--predicted-bg); color: var(--predicted); }
+.chip.negative   { background: var(--negative-bg);  color: var(--negative); }
+.chip.provisional{ background: var(--surface);      color: var(--muted); border: 1px solid var(--rule-strong); }
+
+/* ---- tables ---- */
+.tw { overflow-x: auto; margin: 1.4rem 0 1.6rem; }
+table {
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+  width: 100%;
+  min-width: 30rem;
+}
+caption {
+  font-family: var(--sans);
+  font-size: 0.74rem;
+  color: var(--muted);
+  text-align: left;
+  padding-bottom: 0.6rem;
+  line-height: 1.45;
+}
+th {
+  font-family: var(--sans);
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  text-align: right;
+  padding: 0.45rem 0.7rem;
+  border-bottom: 1px solid var(--rule-strong);
+  white-space: nowrap;
+}
+th:first-child, td:first-child { text-align: left; }
+td {
+  padding: 0.42rem 0.7rem;
+  text-align: right;
+  border-bottom: 1px solid var(--rule);
+  white-space: nowrap;
+}
+tbody tr:last-child td { border-bottom: 1px solid var(--rule-strong); }
+td.meas { color: var(--measured); font-weight: 500; }
+td.pred { color: var(--predicted); }
+td.ref  { color: var(--ref); }
+td.neg  { color: var(--negative); font-weight: 500; }
+td.name { font-family: var(--sans); font-size: 0.78rem; color: var(--ink); }
+tr.hl td { background: var(--surface); }
+.dim { color: var(--muted); }
+
+/* ---- figures ---- */
+figure { margin: 1.8rem 0 1.8rem; max-width: 100%; }
+figure svg { display: block; width: 100%; height: auto; overflow: visible; }
+figcaption {
+  font-family: var(--sans); font-size: 0.74rem; color: var(--muted);
+  line-height: 1.5; margin-top: 0.7rem; max-width: 60ch;
+}
+figcaption b { font-family: var(--sans); font-weight: 600; color: var(--ink-soft); }
+.fignum {
+  font-family: var(--mono); font-size: 0.7rem; font-weight: 500;
+  color: var(--ink-soft); letter-spacing: 0.04em; margin-right: 0.5rem;
+}
+.sv-t { font-family: "IBM Plex Sans", system-ui, sans-serif; font-size: 11px; fill: var(--muted); }
+.sv-l { font-family: "IBM Plex Sans", system-ui, sans-serif; font-size: 11.5px; font-weight: 600; }
+.sv-n { font-family: "IBM Plex Mono", monospace; font-size: 10.5px; fill: var(--muted); }
+.sv-b { font-family: "IBM Plex Sans", system-ui, sans-serif; font-size: 10px; font-weight: 600; fill: var(--ink-soft); letter-spacing: 0.06em; }
+
+/* ---- key claim ---- */
+.claim {
+  margin: 1.8rem 0 1.8rem var(--rail);
+  padding: 1.15rem 1.4rem;
+  border-left: 2px solid var(--rule-strong);
+  background: var(--surface);
+  font-size: 1.02rem;
+  line-height: 1.5;
+  max-width: 62ch;
+}
+@media (max-width: 720px) { .claim { margin-left: 0; } }
+.claim strong { color: var(--ink); }
+
+/* ---- correction entries ---- */
+.corr { border-top: 1px solid var(--rule); padding: 1.1rem 0; max-width: var(--measure); }
+.corr:last-child { border-bottom: 1px solid var(--rule); }
+.corr-h {
+  font-family: var(--sans); font-size: 0.9rem; font-weight: 600;
+  margin: 0 0 0.4rem; color: var(--ink);
+}
+.corr p { font-size: 0.92rem; margin: 0 0 0.5rem; color: var(--ink-soft); }
+.corr p:last-child { margin-bottom: 0; }
+.arrow { font-family: var(--mono); color: var(--muted); }
+
+ul { max-width: var(--measure); padding-left: 1.15rem; margin: 0 0 1.05rem; }
+li { margin-bottom: 0.45rem; }
+
+footer {
+  margin: 4rem 0 0 var(--rail);
+  padding-top: 1.4rem;
+  border-top: 1px solid var(--rule-strong);
+  font-family: var(--mono);
+  font-size: 0.74rem;
+  color: var(--muted);
+  line-height: 1.7;
+  max-width: var(--measure);
+}
+@media (max-width: 720px) { footer { margin-left: 0; } }
+</style>
+
+<div class="wrap">
+
+<header class="paper">
+  <p class="eyebrow">Reproduction report &middot; Table 1 reproduced, cost model measured, mechanism confirmed</p>
+  <h1>Measuring SPIRe</h1>
+  <p class="subtitle">Putting a stopwatch to a speculative-decoding cost model that was only ever computed on paper.</p>
+  <div class="byline">
+    <span>Nishant N. &middot; UC Irvine</span>
+    <span>seqax fork &middot; branch <span class="m">spire_reproducer</span></span>
+    <span>H100 PCIe 80GB &middot; JAX 0.6.0</span>
+    <span>updated 2026-09-19</span>
+  </div>
+</header>
+
+<div class="abstract">
+  <span class="lbl">Abstract</span>
+  <p>SPIRe (Neelam et al., MatX, arXiv:2504.06419) reports roughly 2&times; throughput over vanilla speculative decoding and 35% over a MagicDec-style baseline. Those figures come from an analytical roofline cost model, not from measurement. This work reproduces the paper's models from scratch &mdash; a 67M-parameter target and three drafts, all architectures and token budgets exactly as specified &mdash; and measures what the model predicts.</p>
+  <p>All three of the paper's draft models are now trained, and <strong>Table 1 is reproduced in full</strong> &mdash; nine cells across three methods and three context lengths, at the paper's own configuration. Acceptance lands within 2% for the dense baseline and 6&ndash;8% for the two sparse methods, with the ordering correct at every context length. The <em>shape</em> reproduces more closely than the level: MagicDec is the only method whose acceptance genuinely drifts with context length, and it drifts in the same direction and by nearly the same amount as published.</p>
+  <p>The cost model is then measured. It is optimistic by a strikingly flat <strong>25%</strong> across 24 configurations, and every absolute throughput lands at 0.75&ndash;0.76 of prediction &mdash; but the paper&rsquo;s claims are <em>ratios between methods</em>, and a common factor cancels from a ratio. Its headline &ldquo;over 100% versus vanilla, over 35% versus MagicDec&rdquo; measures on hardware as <strong>+104% and +33%</strong>. The comparative conclusions survive measurement; the absolute ones do not. Two things emerge that only measurement can show: vanilla speculative decoding is a net <em>loss</em> in this regime, and depth behaves asymmetrically &mdash; the dense draft has a sharp optimum it degrades badly past, while both sparse drafts are flat from k&asymp;4 onward.</p>
+
+  <p>Finally the method&rsquo;s central mechanism is measured, which the paper never does: the claim that a windowed draft gets cheaper relative to the target as context grows. Over a 5&times; context range the dense control holds flat while both sparse drafts fall, and <strong>SPIRe&rsquo;s measured margin over vanilla grows from 1.99&times; to 2.50&times;</strong>. The paper&rsquo;s headline +104% turns out to be a floor &mdash; quoted at the shortest context in its own grid, where the mechanism has barely engaged. The same sweep finds a trend running the other way that the paper&rsquo;s context range is too short to see: SPIRe&rsquo;s lead over MagicDec <em>shrinks</em> with context.</p>
+
+  <p>Along the way the reproduction recovers a sampling temperature the paper never states, shows that at greedy decoding the ranking of the three methods <em>inverts</em>, and extends the analysis to speculation depths <span class="m">k = 1&hellip;8</span> where the paper reports only <span class="m">k = 4</span>. It also finds that the paper's cost model charges a sparse draft for a cache one speculation depth too small to actually run, and that the extra FLOPs term it adds for SPIRe changes nothing at any operating point it plots.</p>
+  <p>It also reports the corrections this reproduction had to make to <em>itself</em> &mdash; two findings retracted outright once the paper was read in full rather than reconstructed from its appendix, and one architecture rebuilt after three training runs against the wrong operator. Those are given equal weight here on purpose. Every wrong result looked healthy from inside the training loop, and the ones that survived did so because they were checked against something outside it.</p>
+</div>
+
+<section>
+  <span class="secno">1</span>
+  <h2>What was built</h2>
+  <p>Four models trained from scratch on LongCrawl64, each at Chinchilla-optimal ~20 tokens per parameter. Architectures and token budgets follow the paper exactly; all three body-parameter counts reproduce the values printed in the paper's appendix notebook to the digit.</p>
+
+  <div class="tw">
+  <table>
+    <caption>Models. Eval loss is held-out hard-target cross-entropy over 50.3M tokens, so the comparison is like-for-like even where training objectives differ. It is omitted for full SPIRe on purpose: evaluation supplies no teacher, so that model falls back to computing its own keys and values everywhere, which is not the condition it runs in. Acceptance at decode is the metric that describes it.</caption>
+    <thead>
+      <tr><th>Model</th><th>Layers / d_model</th><th>Body params</th><th>Train tokens</th><th>Eval loss</th><th>Wall</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="name">Target</td><td>8 / 512</td><td>67,117,056</td><td>2,372,567,040</td><td class="meas">2.534</td><td class="dim">5.5 h</td></tr>
+      <tr><td class="name">Vanilla draft</td><td>4 / 256</td><td>8,390,656</td><td>682,926,080</td><td class="meas">3.067</td><td class="dim">45 min</td></tr>
+      <tr><td class="name">SPIRe ablation</td><td>2 / 512</td><td>16,779,264</td><td>1,365,811,200</td><td class="meas">3.000</td><td class="dim">2.5 h</td></tr>
+      <tr class="hl"><td class="name">SPIRe (full, all six techniques)</td><td>2 / 512</td><td>16,779,264</td><td>1,365,811,200</td><td class="dim">n/a</td><td class="dim">7 h</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>The SPIRe draft is initialized by pruning the target &mdash; draft layer <span class="m">j</span> is target layer <span class="m">j+6</span>, with the embedding, unembedding and both outer layernorms copied wholesale &mdash; then trained under a StreamingLLM sink-plus-window mask with a mixed loss of distillation cross-entropy and expected acceptance probability. It beats the vanilla draft on held-out loss <em>while attending to 64 tokens instead of 1024</em>.</p>
+
+
+  <figure>
+    <svg viewBox="0 0 620 250" role="img" aria-label="The SPIRe draft is the target's last two layers, pruned out and given a sink-plus-window attention mask.">
+      <text class="sv-b" x="0" y="12">TARGET &middot; 8 LAYERS &middot; DENSE ATTENTION</text>
+      <g><rect x="6" y="26" width="20" height="56" rx="2" fill="var(--surface)" stroke="var(--rule-strong)" stroke-width="1"/><rect x="32" y="26" width="20" height="56" rx="2" fill="var(--surface)" stroke="var(--rule-strong)" stroke-width="1"/><rect x="58" y="26" width="20" height="56" rx="2" fill="var(--surface)" stroke="var(--rule-strong)" stroke-width="1"/><rect x="84" y="26" width="20" height="56" rx="2" fill="var(--surface)" stroke="var(--rule-strong)" stroke-width="1"/><rect x="110" y="26" width="20" height="56" rx="2" fill="var(--surface)" stroke="var(--rule-strong)" stroke-width="1"/><rect x="136" y="26" width="20" height="56" rx="2" fill="var(--surface)" stroke="var(--rule-strong)" stroke-width="1"/><rect x="162" y="26" width="20" height="56" rx="2" fill="var(--surface)" stroke="var(--rule-strong)" stroke-width="1"/><rect x="188" y="26" width="20" height="56" rx="2" fill="var(--surface)" stroke="var(--rule-strong)" stroke-width="1"/>
+      </g><text class="sv-n" x="16" y="96" text-anchor="middle">1</text><text class="sv-n" x="42" y="96" text-anchor="middle">2</text><text class="sv-n" x="68" y="96" text-anchor="middle">3</text><text class="sv-n" x="94" y="96" text-anchor="middle">4</text><text class="sv-n" x="120" y="96" text-anchor="middle">5</text><text class="sv-n" x="146" y="96" text-anchor="middle">6</text><text class="sv-n" x="172" y="96" text-anchor="middle">7</text><text class="sv-n" x="198" y="96" text-anchor="middle">8</text>
+      <rect x="162" y="22" width="72" height="64" rx="3" fill="none" stroke="var(--s-spire)" stroke-width="2" stroke-dasharray="4 3"/>
+      <text class="sv-t" x="198" y="16" text-anchor="middle" fill="var(--s-spire)">layers 7&ndash;8</text>
+      <path d="M198 90 L198 118" stroke="var(--s-spire)" stroke-width="2" fill="none"/>
+      <path d="M198 124 l-5 -8 l10 0 z" fill="var(--s-spire)"/>
+      <text class="sv-b" x="0" y="146">SPIRE DRAFT &middot; 2 LAYERS &middot; SINK + WINDOW</text>
+      <rect x="162" y="158" width="20" height="56" rx="2" fill="var(--surface)" stroke="var(--s-spire)" stroke-width="1.5"/>
+      <rect x="188" y="158" width="20" height="56" rx="2" fill="var(--surface)" stroke="var(--s-spire)" stroke-width="1.5"/>
+      <text class="sv-n" x="172" y="228" text-anchor="middle">1</text>
+      <text class="sv-n" x="198" y="228" text-anchor="middle">2</text>
+      <text class="sv-t" x="222" y="180">embedding, unembedding and both</text>
+      <text class="sv-t" x="222" y="196">layernorms copied wholesale</text>
+      <text class="sv-t" x="222" y="212" fill="var(--measured)">16,779,264 body params = 1/4 of target</text>
+      <g transform="translate(360 20)">
+        <text class="sv-b" x="0" y="6">ATTENTION SEEN BY EACH</text>
+        <text class="sv-t" x="0" y="30">target &mdash; all 512 positions</text><rect x="0.0" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="7.6" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="15.2" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="22.799999999999997" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="30.4" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="38.0" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="45.599999999999994" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="53.199999999999996" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="60.8" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="68.39999999999999" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="76.0" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="83.6" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="91.19999999999999" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="98.8" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="106.39999999999999" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="114.0" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="121.6" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="129.2" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="136.79999999999998" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="144.4" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="152.0" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="159.6" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="167.2" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="174.79999999999998" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="182.39999999999998" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="190.0" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="197.6" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="205.2" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="212.79999999999998" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="220.39999999999998" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="228.0" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/><rect x="235.6" y="38" width="6" height="10" rx="1" fill="var(--rule-strong)"/>
+        <text class="sv-t" x="0" y="76">draft &mdash; sink 1 + window 64</text><rect x="0.0" y="84" width="6" height="10" rx="1" fill="var(--s-spire)"/><rect x="7.6" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="15.2" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="22.799999999999997" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="30.4" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="38.0" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="45.599999999999994" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="53.199999999999996" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="60.8" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="68.39999999999999" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="76.0" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="83.6" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="91.19999999999999" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="98.8" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="106.39999999999999" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="114.0" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="121.6" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="129.2" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="136.79999999999998" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="144.4" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="152.0" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="159.6" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="167.2" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="174.79999999999998" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="182.39999999999998" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="190.0" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="197.6" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="205.2" y="84" width="6" height="10" rx="1" fill="var(--grid)"/><rect x="212.79999999999998" y="84" width="6" height="10" rx="1" fill="var(--s-spire)"/><rect x="220.39999999999998" y="84" width="6" height="10" rx="1" fill="var(--s-spire)"/><rect x="228.0" y="84" width="6" height="10" rx="1" fill="var(--s-spire)"/><rect x="235.6" y="84" width="6" height="10" rx="1" fill="var(--s-spire)"/>
+        <text class="sv-n" x="0" y="110">sink</text>
+        <text class="sv-n" x="243" y="110" text-anchor="end">window</text>
+      </g>
+    </svg>
+    <figcaption><span class="fignum">FIG 1</span><b>Pruned initialization.</b> The draft is not a smaller model trained from scratch &mdash; it is the target's last two layers lifted out and given a sparse attention mask. Because it matches the target in every dimension except depth, the initialization is a literal tensor slice. It also inherits the embedding and unembedding, which are 51.5M of its 68.3M total parameters.</figcaption>
+  </figure>
+
+  <h3>A note on the data</h3>
+  <p>The corpus the paper trains on is no longer where it was published: <code>gs://longcrawl64</code> returns <span class="m">NoSuchBucket</span> from every Google Cloud endpoint. Work proceeds on a HuggingFace mirror whose train and heldout document counts sum to exactly the 6,661,465 the dataset's authors report. Rebuilding the working subset on a fresh machine reproduced <strong>674 of 674 source chunks byte-identically</strong>, so the mirror is verifiably stable rather than merely plausible.</p>
+</section>
+
+<section>
+  <span class="secno">2</span>
+  <h2>Reproduction<span class="chip confirmed">confirmed</span></h2>
+  <p>Acceptance is measured as <span class="m">&tau;</span>, the mean tokens committed per speculative round. It depends only on the two models' distributions &mdash; not on hardware, kernels, or memory layout &mdash; which is why it can be reproduced independently of the cost model it feeds.</p>
+
+  <div class="tw">
+  <table>
+    <caption>The paper&rsquo;s Table 1, reproduced. <span class="m">k=4</span>, sink 1, window fixed at 64, T&nbsp;=&nbsp;1.0, ~1,200 validation contexts per cell, scored under the paper&rsquo;s own stopping rule &mdash; the rounds a context needs to emit 64 tokens, not a fixed round count.</caption>
+    <thead>
+      <tr><th>L</th><th>Vanilla</th><th>paper</th><th>MagicDec</th><th>paper</th><th>SPIRe</th><th>paper</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="name">960</td><td class="meas">2.580 &plusmn;.017</td><td class="ref">2.644</td><td class="meas">3.554 &plusmn;.021</td><td class="ref">3.793</td><td class="meas">3.106 &plusmn;.020</td><td class="ref">3.382</td></tr>
+      <tr class="hl"><td class="name">512</td><td class="meas">2.594 &plusmn;.018</td><td class="ref">2.647</td><td class="meas">3.648 &plusmn;.021</td><td class="ref">3.891</td><td class="meas">3.140 &plusmn;.020</td><td class="ref">3.401</td></tr>
+      <tr><td class="name">256</td><td class="meas">2.590 &plusmn;.018</td><td class="ref">2.637</td><td class="meas">3.781 &plusmn;.021</td><td class="ref">4.005</td><td class="meas">3.139 &plusmn;.020</td><td class="ref">3.427</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>The gap is small but it has structure: the dense draft lands within <strong>1.8&ndash;2.4%</strong>, while both sparse-attention methods sit <strong>5.6&ndash;8.4%</strong> low. That pattern points at the StreamingLLM implementation or the training corpus rather than at any one method, and it is discussed in &sect;9.</p>
+
+  <h3>The dependence on context length reproduces better than the level</h3>
+
+  <div class="tw">
+  <table>
+    <caption>Spread of &tau; across L = 256&hellip;960, measured against published.</caption>
+    <thead><tr><th>Method</th><th>This work</th><th>Paper</th><th>Direction</th></tr></thead>
+    <tbody>
+      <tr><td class="name">Vanilla</td><td class="meas">0.5%</td><td class="ref">0.4%</td><td class="dim">flat</td></tr>
+      <tr><td class="name">SPIRe</td><td class="meas">1.1%</td><td class="ref">1.3%</td><td class="dim">flat</td></tr>
+      <tr class="hl"><td class="name">MagicDec</td><td class="meas">6.4%</td><td class="ref">5.6%</td><td class="dim">falls with L</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="claim">
+    Two of the three methods are flat in context length to within a percent, and the third is not &mdash; <strong>and it is the same third, moving the same way, by nearly the same amount</strong>. MagicDec is the one method whose draft is the full target model, so it has the most to lose as the context its 64-token window cannot reach grows. A reproduction that merely landed near the right numbers would not have recovered that.
+  </div>
+</section>
+
+<section>
+  <span class="secno">3</span>
+  <h2>The paper's unstated temperature is recoverable<span class="chip confirmed">confirmed</span></h2>
+  <p>The paper never records whether it samples greedily or at temperature 1. The choice is not small, and measuring both settles it.</p>
+
+  <div class="tw">
+  <table>
+    <caption>Deviation from the paper&rsquo;s reported &tau; under each sampling mode, at L=512, now across all three methods.</caption>
+    <thead><tr><th>Method</th><th>&tau; at T = 0.0</th><th>vs paper</th><th>&tau; at T = 1.0</th><th>vs paper</th></tr></thead>
+    <tbody>
+      <tr><td class="name">Vanilla</td><td class="dim">3.333</td><td class="pred">+26%</td><td class="meas">2.594</td><td class="meas">&minus;2.0%</td></tr>
+      <tr><td class="name">MagicDec</td><td class="dim">3.434</td><td class="pred">&minus;12%</td><td class="meas">3.648</td><td class="meas">&minus;6.2%</td></tr>
+      <tr><td class="name">SPIRe</td><td class="dim">3.224</td><td class="pred">&minus;5.2%</td><td class="meas">3.140</td><td class="meas">&minus;7.7%</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>At T&nbsp;=&nbsp;1.0 every method is low by a few percent &mdash; the signature of shared, known deviations. At greedy the errors run <em>+26% and &minus;12% in opposite directions</em>, which is the signature of a wrong shared setting rather than an imperfect one. The paper&rsquo;s MagicDec-over-vanilla margin is 1.244, against 1.054 at T&nbsp;=&nbsp;1.0 and only 0.101 at greedy.</p>
+
+  <h3>At greedy, the ranking inverts</h3>
+  <p>Sampling <em>helps</em> MagicDec and <em>hurts</em> the independently-trained vanilla draft, so much so that the order of the three methods is not the same in the two regimes:</p>
+
+  <div class="tw">
+  <table>
+    <caption>Ranking by &tau; at L=512. The methods are the same; only the sampling temperature differs.</caption>
+    <thead><tr><th>Rank</th><th>at T = 1.0 (paper&rsquo;s regime)</th><th>at T = 0.0 (greedy)</th></tr></thead>
+    <tbody>
+      <tr><td class="name">1</td><td class="dim" style="text-align:left">MagicDec &mdash; 3.648</td><td class="dim" style="text-align:left">MagicDec &mdash; 3.434</td></tr>
+      <tr><td class="name">2</td><td class="dim" style="text-align:left">SPIRe &mdash; 3.140</td><td class="neg" style="text-align:left">Vanilla &mdash; 3.333</td></tr>
+      <tr><td class="name">3</td><td class="dim" style="text-align:left">Vanilla &mdash; 2.594</td><td class="neg" style="text-align:left">SPIRe &mdash; 3.224</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>The mechanism is clean. MagicDec&rsquo;s draft <em>is</em> the target, so its distribution matches exactly and Leviathan&rsquo;s <span class="m">min(1, p/q)</span> accepts readily at any temperature. A distilled draft is trained to match distributions, so it changes least. An independently trained draft agrees on the argmax far more often than on the distribution &mdash; which greedy decoding rewards and sampling penalizes.</p>
+
+  <div class="claim">
+    This is a confound in the paper&rsquo;s headline comparison, and it is larger than the comparison. Greedy decoding compresses three methods into a <strong>0.21-point band</strong> and <strong>reverses which of SPIRe and vanilla is better</strong>, on a hyperparameter the paper never records. Any &tau; reported without a stated temperature is under-determined by more than the effect being claimed.
+  </div>
+</section>
+
+<section>
+  <span class="secno">4</span>
+  <h2>Speculation depth, k = 1 to 8<span class="chip confirmed">confirmed</span></h2>
+  <p>The paper reports a single depth, <span class="m">k = 4</span>. Sweeping the full range needs no retraining, and the methods turn out to saturate at very different rates.</p>
+
+  <div class="tw">
+  <table>
+    <caption>&tau; against speculation depth at <span class="m">L=512</span>, T&nbsp;=&nbsp;1.0, 600 contexts, scored under the same G=64 stopping rule as &sect;2. The paper's operating point is k=4. Retaken against the rebuilt SPIRe draft of &sect;5; the k=4 column reproduces the &sect;2 row to within the wider interval of the smaller sample.</caption>
+    <thead><tr><th>k</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th></tr></thead>
+    <tbody>
+      <tr><td class="name">MagicDec</td><td>1.853</td><td>2.560</td><td>3.156</td><td class="meas">3.688</td><td>4.095</td><td>4.490</td><td>4.788</td><td class="meas">5.119</td></tr>
+      <tr><td class="name">SPIRe</td><td>1.761</td><td>2.346</td><td>2.776</td><td class="meas">3.136</td><td>3.407</td><td>3.594</td><td>3.744</td><td class="meas">3.858</td></tr>
+      <tr><td class="name">Vanilla</td><td>1.659</td><td>2.092</td><td>2.382</td><td class="meas">2.581</td><td>2.708</td><td>2.798</td><td>2.859</td><td class="meas">2.951</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+
+  <figure>
+    <svg viewBox="0 0 620 335" role="img" aria-label="Acceptance against speculation depth for three methods; MagicDec keeps climbing while SPIRe and vanilla flatten.">
+      <line x1="60" y1="248.8" x2="520" y2="248.8" stroke="var(--grid)" stroke-width="1"/>
+      <text class="sv-n" x="50" y="252.2" text-anchor="end">2.0</text>
+      <line x1="60" y1="186.2" x2="520" y2="186.2" stroke="var(--grid)" stroke-width="1"/>
+      <text class="sv-n" x="50" y="189.8" text-anchor="end">3.0</text>
+      <line x1="60" y1="123.8" x2="520" y2="123.8" stroke="var(--grid)" stroke-width="1"/>
+      <text class="sv-n" x="50" y="127.2" text-anchor="end">4.0</text>
+      <line x1="60" y1="61.2" x2="520" y2="61.2" stroke="var(--grid)" stroke-width="1"/>
+      <text class="sv-n" x="50" y="64.8" text-anchor="end">5.0</text>
+      <line x1="257.1" y1="30" x2="257.1" y2="280" stroke="var(--rule-strong)" stroke-width="1" stroke-dasharray="3 3"/>
+      <text class="sv-n" x="257.1" y="22" text-anchor="middle">paper reports k=4 only</text>
+      <text class="sv-n" x="60.0" y="298" text-anchor="middle">1</text>
+      <text class="sv-n" x="125.7" y="298" text-anchor="middle">2</text>
+      <text class="sv-n" x="191.4" y="298" text-anchor="middle">3</text>
+      <text class="sv-n" x="257.1" y="298" text-anchor="middle">4</text>
+      <text class="sv-n" x="322.9" y="298" text-anchor="middle">5</text>
+      <text class="sv-n" x="388.6" y="298" text-anchor="middle">6</text>
+      <text class="sv-n" x="454.3" y="298" text-anchor="middle">7</text>
+      <text class="sv-n" x="520.0" y="298" text-anchor="middle">8</text>
+      <text class="sv-t" x="290" y="318" text-anchor="middle">speculation depth k</text>
+      <text class="sv-t" x="18" y="155" text-anchor="middle" transform="rotate(-90 18 155)">tokens per round (tau)</text>
+      <path d="M60.0 258.0 L125.7 213.7 L191.4 176.4 L257.1 143.1 L322.9 117.7 L388.6 92.9 L454.3 74.3 L520.0 53.6" fill="none" stroke="var(--s-magicdec)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+      <circle cx="60.0" cy="258.0" r="3.4" fill="var(--s-magicdec)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="125.7" cy="213.7" r="3.4" fill="var(--s-magicdec)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="191.4" cy="176.4" r="3.4" fill="var(--s-magicdec)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="257.1" cy="143.1" r="3.4" fill="var(--s-magicdec)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="322.9" cy="117.7" r="3.4" fill="var(--s-magicdec)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="388.6" cy="92.9" r="3.4" fill="var(--s-magicdec)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="454.3" cy="74.3" r="3.4" fill="var(--s-magicdec)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="520.0" cy="53.6" r="3.4" fill="var(--s-magicdec)" stroke="var(--ground)" stroke-width="1.5"/>
+      <text class="sv-l" x="532" y="57.6" fill="var(--s-magicdec)">MagicDec</text>
+      <path d="M60.0 263.8 L125.7 227.1 L191.4 200.2 L257.1 177.7 L322.9 160.7 L388.6 149.0 L454.3 139.6 L520.0 132.5" fill="none" stroke="var(--s-spire)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+      <circle cx="60.0" cy="263.8" r="3.4" fill="var(--s-spire)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="125.7" cy="227.1" r="3.4" fill="var(--s-spire)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="191.4" cy="200.2" r="3.4" fill="var(--s-spire)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="257.1" cy="177.7" r="3.4" fill="var(--s-spire)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="322.9" cy="160.7" r="3.4" fill="var(--s-spire)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="388.6" cy="149.0" r="3.4" fill="var(--s-spire)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="454.3" cy="139.6" r="3.4" fill="var(--s-spire)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="520.0" cy="132.5" r="3.4" fill="var(--s-spire)" stroke="var(--ground)" stroke-width="1.5"/>
+      <text class="sv-l" x="532" y="136.5" fill="var(--s-spire)">SPIRe</text>
+      <path d="M60.0 270.1 L125.7 243.0 L191.4 224.9 L257.1 212.4 L322.9 204.5 L388.6 198.8 L454.3 195.0 L520.0 189.3" fill="none" stroke="var(--s-vanilla)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+      <circle cx="60.0" cy="270.1" r="3.4" fill="var(--s-vanilla)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="125.7" cy="243.0" r="3.4" fill="var(--s-vanilla)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="191.4" cy="224.9" r="3.4" fill="var(--s-vanilla)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="257.1" cy="212.4" r="3.4" fill="var(--s-vanilla)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="322.9" cy="204.5" r="3.4" fill="var(--s-vanilla)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="388.6" cy="198.8" r="3.4" fill="var(--s-vanilla)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="454.3" cy="195.0" r="3.4" fill="var(--s-vanilla)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="520.0" cy="189.3" r="3.4" fill="var(--s-vanilla)" stroke="var(--ground)" stroke-width="1.5"/>
+      <text class="sv-l" x="532" y="193.3" fill="var(--s-vanilla)">Vanilla</text>
+    </svg>
+    <figcaption><span class="fignum">FIG 2</span><b>Acceptance against depth, k = 1 to 8</b>, at L=512, T=1.0. All three rise, but they saturate at very different rates: at k=8 one more depth is still worth <b>+0.331</b> to MagicDec against +0.114 to SPIRe and +0.092 to vanilla. Evaluating everything at the paper's single k=4 catches the small drafts near their ceiling and MagicDec well short of its own.</figcaption>
+  </figure>
+
+  <p>At <span class="m">k=8</span> the marginal gain from one more depth is <strong>+0.331 for MagicDec</strong> against +0.114 for SPIRe and +0.092 for vanilla. MagicDec is still climbing roughly three times faster than either small draft and has not saturated; its draft is the target, so acceptance survives deep into a round, whereas the small drafts are simply not reached that far. Over k=4&rarr;8 the three gain 39%, 23% and 14% respectively.</p>
+
+  <div class="claim">
+    Evaluating every method at a single <span class="m">k=4</span> is <strong>not neutral</strong> &mdash; it is close to the depth at which these three look most alike. MagicDec&rsquo;s lead over SPIRe more than doubles across the sweep, from <span class="m">+0.552</span> at k=4 to <strong>+1.261 at k=8</strong>, while SPIRe&rsquo;s lead over vanilla grows far less, +0.555 to +0.907. Read at k=4 the two margins are almost identical; read at k=8 they are not close.
+  </div>
+
+  <p>A second view of the same effect: <span class="m">&tau;/(k+1)</span>, the fraction of each round&rsquo;s capacity actually used, falls from 0.926 to 0.569 for MagicDec, 0.880 to 0.429 for SPIRe and 0.830 to 0.328 for vanilla. All three decay, but by k=8 vanilla is discarding two thirds of every round while MagicDec still uses over half &mdash; which is the trade the cost model has to price, since a larger draft costs more per token drafted.</p>
+</section>
+
+<section>
+  <span class="secno">4b</span>
+  <h2>A finding this work retracted<span class="chip corrected">retracted</span></h2>
+  <p>An earlier version of this report claimed that acceptance varies substantially with context length while the cost model assumes it constant. That claim was wrong on both halves, and the error is instructive.</p>
+
+  <div class="claim">
+    <strong>The paper measures it.</strong> Table 1 reports &tau; at L = 256, 512 and 960 for all three methods. Vanilla varies 0.4% across that range, SPIRe 1.3%, MagicDec 5.3%. The constancy assumption is stated <em>and</em> supported with data, not smuggled in.
+  </div>
+
+  <div class="tw">
+  <table>
+    <caption>The paper&rsquo;s Table 1 &mdash; average generation length by context length, 95% CI from n = 65,536 contexts.</caption>
+    <thead><tr><th>Context length</th><th>Vanilla SD</th><th>MagicDec</th><th>SPIRe</th></tr></thead>
+    <tbody>
+      <tr><td class="name">960</td><td class="ref">2.644 &plusmn; 0.004</td><td class="ref">3.793 &plusmn; 0.004</td><td class="ref">3.382 &plusmn; 0.004</td></tr>
+      <tr class="hl"><td class="name">512</td><td class="ref">2.647 &plusmn; 0.004</td><td class="ref">3.891 &plusmn; 0.004</td><td class="ref">3.401 &plusmn; 0.004</td></tr>
+      <tr><td class="name">256</td><td class="ref">2.637 &plusmn; 0.004</td><td class="ref">4.005 &plusmn; 0.004</td><td class="ref">3.427 &plusmn; 0.004</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>And the variation measured here was self-inflicted</h3>
+  <p>SPIRe and MagicDec use a StreamingLLM mask with <strong>a window fixed at 64 tokens at every context length</strong> &mdash; the paper is explicit that the KV cache size is constant with respect to sequence length. This reproduction scaled the window as <span class="m">L/8</span>, a parameter taken from a reconstruction of the appendix rather than from the paper. At L=512 the two coincide, which is exactly why that column reproduced and the others did not.</p>
+
+  <p>So the 14% spread reported earlier was a window sweep wearing a context-length label. Those measurements are withdrawn. They have since been retaken at a fixed window &mdash; that is the table in &sect;2 &mdash; and the corrected version agrees with the paper: vanilla and SPIRe are flat in L to within 1.1%, MagicDec falls 6.4% across the range against the paper&rsquo;s 5.6%. The real effect was smaller than the artifact that hid it, and in the same direction as the paper&rsquo;s own data rather than against it.</p>
+
+  <h3>What survives</h3>
+  <p>The underlying observation is still real, just not a criticism of the paper: a sparse draft is <em>sharply</em> sensitive to a change in its window, and asymmetrically so.</p>
+
+  <figure>
+    <svg viewBox="0 0 620 175" role="img" aria-label="Evaluating a sparse draft at a wider window than it trained on halves its acceptance.">
+      <text class="sv-t" x="138" y="46" text-anchor="end">32 (narrower)</text>
+      <rect x="150" y="33" width="259.0" height="20" rx="3" fill="var(--muted)"/>
+      <text class="sv-n" x="418.0" y="47" fill="var(--ink-soft)">2.590</text>
+      <text class="sv-t" x="138" y="90" text-anchor="end">64 (as trained)</text>
+      <rect x="150" y="77" width="285.6" height="20" rx="3" fill="var(--measured)"/>
+      <text class="sv-n" x="444.6" y="91" fill="var(--ink-soft)">2.856</text>
+      <text class="sv-t" x="138" y="134" text-anchor="end">128 (wider)</text>
+      <rect x="150" y="121" width="145.8" height="20" rx="3" fill="var(--negative)"/>
+      <text class="sv-n" x="304.8" y="135" fill="var(--ink-soft)">1.458</text>
+      <text class="sv-t" x="150" y="176">tau at k=4, T=0.0 &mdash; draft trained at window 64</text>
+    </svg>
+    <figcaption><span class="fignum">FIG 3</span><b>Window mismatch is asymmetric.</b> Evaluating the draft at a narrower window than it trained on costs 9%; a wider one costs <b>49%</b> and drops acceptance to 0.115, barely better than not speculating. A narrower window is a subset of the learned pattern; a wider one is off-distribution. The paper never does this &mdash; it fixes the window at 64 &mdash; so this is a robustness property rather than a critique, and it is the mechanism behind the retraction above.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <span class="secno">5</span>
+  <h2>Feedback memory: three runs against the wrong mechanism, then rebuilt<span class="chip corrected">corrected</span></h2>
+  <p>Three full training runs went into SPIRe&rsquo;s feedback memory, and all three measured something the paper does not describe. The error was not at the margins &mdash; it was the wrong operation.</p>
+
+  <div class="claim">
+    The paper&rsquo;s &sect;3.3 specifies <span class="m">z<sup>&ell;</sup><sub>t</sub> = Attention(x<sup>&ell;</sup><sub>t</sub>, m<sub>&lt;t</sub>)</span> &mdash; the memory <strong>replaces the keys and values</strong>, and is read from <em>previous</em> positions. This work implemented <span class="m">x = x + &Sigma; w&middot;bank</span>: an additive injection at the <em>same</em> position. Everything that followed was downstream of that.
+  </div>
+
+  <div class="tw">
+  <table>
+    <caption>What each wrong conclusion actually followed from.</caption>
+    <thead><tr><th>Concluded here</th><th>Why it does not hold</th></tr></thead>
+    <tbody>
+      <tr><td class="name">Slot j at layer j is the residual stream, so the mechanism is a rescale</td><td class="dim" style="text-align:left">true only when memory is consumed at the same position; real memory is read at later ones</td></tr>
+      <tr><td class="name">One usable scalar for a 2-layer draft</td><td class="dim" style="text-align:left">capacity is attention over every past position&rsquo;s memory, not six coefficients</td></tr>
+      <tr><td class="name">A depth-causal mask is required</td><td class="dim" style="text-align:left">prevents a cycle that never existed &mdash; m<sub>t</sub> is built from all of position t and read only after it</td></tr>
+      <tr><td class="name">Including the target&rsquo;s final layer is an information leak</td><td class="dim" style="text-align:left">it is legitimate context, never used to predict its own position</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>What the specification actually says</h3>
+  <p>Per-layer memory vectors, not shared: <span class="m">m<sup>i</sup><sub>t</sub></span> is a softmax-weighted sum over the draft&rsquo;s <span class="m">n<sub>layer</sub>+1</span> activations at position t, layer 0 being the embedding. The substitution is a direct assignment rather than a mix &mdash; for <span class="m">t &le; S&minus;k</span>, <span class="m">m<sup>1</sup><sub>t</sub> = y<sup>6</sup><sub>t</sub></span> and <span class="m">m<sup>2</sup><sub>t</sub> = y<sup>7</sup><sub>t</sub></span>, the target&rsquo;s layers 6 and 7, matching the pruned initialization from layers 7 and 8. Training performs k=4 forward passes on every k-th prefix; the substitution exists precisely so the first S&minus;k memory vectors never have to be computed sequentially, which is what makes the Feedback Transformer affordable to train at all.</p>
+
+  <p>The paper also ranks its own components. Figure 5 orders them: sparse KV cache, <strong>attending to target activations</strong>, distillation loss, pruned initialization, <strong>feedback memory</strong>, MixedLoss. The supervision ranks second; the mixing mechanism fifth.</p>
+
+  <h3>Rebuilt, trained, and measured</h3>
+  <p>The mechanism was then implemented as specified &mdash; memory vectors replacing the keys and values, read strictly from previous positions, with the k in-flight positions using the draft&rsquo;s own softmax-weighted mix over all its layer states and everything earlier substituted by the target&rsquo;s activations &mdash; and the model retrained. Seven hours, 2.2&times; the wall time of the same step count without the recurrence, because training now needs k sequential forward passes per step.</p>
+
+  <div class="tw">
+  <table>
+    <caption>What the memory pathway is worth. All four figures from the same harness, so they are directly comparable.</caption>
+    <thead><tr><th>Model</th><th>Measured</th><th>Paper</th><th>Gap</th></tr></thead>
+    <tbody>
+      <tr><td class="name">SPIRe ablation (neither memory component)</td><td class="meas">2.834 &plusmn;.019</td><td class="ref">2.959</td><td class="dim">&minus;4.2%</td></tr>
+      <tr><td class="name">SPIRe full (both)</td><td class="meas">3.140 &plusmn;.020</td><td class="ref">3.401</td><td class="dim">&minus;7.7%</td></tr>
+      <tr class="hl"><td class="name">the pathway is worth</td><td class="meas">+0.306</td><td class="ref">+0.442</td><td class="pred">69% captured</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>It works, and it is the largest single component added here &mdash; but it delivers about two thirds of its published benefit. Three explanations were tested and all three are dead:</p>
+
+  <div class="corr">
+    <p class="corr-h">Measurement convention <span class="arrow">&rarr;</span> ruled out</p>
+    <p>The ablation&rsquo;s original 2.851 was taken under a fixed round count and the new figure under a token budget, and the stopping rule alone is worth ~3%. Re-running the ablation under the current harness gives <strong>2.834</strong> &mdash; 0.6%, inside run-to-run jitter.</p>
+  </div>
+
+  <div class="corr">
+    <p class="corr-h">Mixing weights stuck at initialization <span class="arrow">&rarr;</span> ruled out</p>
+    <p>The weights are zero-initialized, which under a softmax is a <em>uniform</em> mix rather than a no-op, so the draft could plausibly have started somewhere unhelpful and stayed. It did not: the trained mix reads 0.264 / 0.634 / 0.102 and 0.115 / 0.555 / 0.330 against 0.333 uniform. Both layers concentrated on the first layer&rsquo;s output.</p>
+  </div>
+
+  <div class="corr">
+    <p class="corr-h">A window off-by-one <span class="arrow">&rarr;</span> ruled out</p>
+    <p>Feedback memory reads <span class="m">m<sub>&lt;t</sub></span> strictly, so a window of 64 leaves 63 <em>readable</em> memory vectors where the paper may intend 64. Measured at both: SPIRe moves <strong>3.127 &rarr; 3.131</strong>, 0.14 standard errors. MagicDec, which has no feedback memory and does read its own slot, moved seven times more &mdash; the opposite of the prediction, and both inside noise.</p>
+  </div>
+
+  <p>What remains is a training-data effect that cannot be fixed by retraining: the surviving mirror holds ~10% of the corpus, and at the paper&rsquo;s document length it yields 0.65B tokens against a 2.37B budget, so this work uses documents four times longer and four times fewer. That fits the shape of the gap &mdash; the dense draft is 2% low and both sparse drafts are 4&ndash;8% low, and a draft learning to exploit a 64-token window plus target activations plausibly needs more document diversity than one that simply reads everything.</p>
+</section>
+
+<section>
+  <span class="secno">6</span>
+  <h2>Cost model<span class="chip confirmed">measured</span></h2>
+  <p>The paper's speedups derive from <span class="m">ITM = (speculate + verify) / target</span>, the cost of one speculative round relative to one plain decode step, with end-to-end speedup <span class="m">&tau; / ITM</span>. Measuring it directly requires controlling several confounds that are easy to miss; the harness holds the token budget fixed rather than the round count, pins the KV allocation identically across depths, measures actual tokens generated rather than assuming them, and cross-checks its own &tau; against the independent acceptance harness.</p>
+
+  <div class="tw">
+  <table>
+    <caption>What the cost model predicts at the paper&rsquo;s highlighted operating point, B=64, L=512, k=4, HOI=600 (H100 SXM, the card the paper plots). Measured values follow below.</caption>
+    <thead><tr><th>Method</th><th>ITM predicted</th><th>&tau; / ITM</th><th>Paper&rsquo;s Figure 4</th><th>Error</th></tr></thead>
+    <tbody>
+      <tr><td class="name">Vanilla</td><td class="pred">1.944</td><td class="pred">1.36&times;</td><td class="ref">1.36&times;</td><td class="meas">0.1%</td></tr>
+      <tr><td class="name">MagicDec</td><td class="pred">1.896</td><td class="pred">2.05&times;</td><td class="ref">2.05&times;</td><td class="meas">0.1%</td></tr>
+      <tr class="hl"><td class="name">SPIRe</td><td class="pred">1.224</td><td class="pred">2.78&times;</td><td class="ref">2.78&times;</td><td class="meas">0.0%</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="claim">
+    Every &ldquo;measured versus predicted&rdquo; number in this work is a comparison against that transcription, so a transcription error would not surface as a crash &mdash; it would surface as a finding. It is therefore pinned to values the paper published rather than to itself: the three body-parameter counts printed in the appendix, and the three throughput multipliers highlighted in Figure 4, which reproduce to <strong>0.1%</strong> and are the source of the paper&rsquo;s &ldquo;over 100% versus vanilla, over 35% versus MagicDec&rdquo; claim. It also reproduces those two margins directly: 35% and 104%.
+  </div>
+
+  <p>All three drafts are now timed end to end on an H100 PCIe, k = 1&hellip;8, with <span class="m">Klen</span> pinned to 768 across every cell so the target&rsquo;s cache &mdash; the denominator of every ITM &mdash; is identical for all three. Validation passes in all three modes: ITM monotonic in k, worst jitter 1.7% against a 10% threshold, token ranges matched to 3.8&ndash;8.0%.</p>
+
+  <div class="tw">
+  <table>
+    <caption>Measured &divide; predicted ITM. Above 1.0 means the model is optimistic &mdash; it under-charges a speculative round.</caption>
+    <thead><tr><th>Method</th><th>k=1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th><th>mean</th></tr></thead>
+    <tbody>
+      <tr><td class="name">Vanilla</td><td>1.33</td><td>1.30</td><td>1.31</td><td>1.30</td><td>1.28</td><td>1.27</td><td>1.26</td><td>1.25</td><td class="meas">1.29</td></tr>
+      <tr><td class="name">MagicDec</td><td>1.32</td><td>1.29</td><td>1.26</td><td>1.25</td><td>1.23</td><td>1.21</td><td>1.18</td><td>1.17</td><td class="meas">1.24</td></tr>
+      <tr><td class="name">SPIRe</td><td>1.15</td><td>1.17</td><td>1.19</td><td>1.23</td><td>1.23</td><td>1.26</td><td>1.25</td><td>1.27</td><td class="meas">1.22</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Across all 24 cells the model is optimistic by <strong>1.15&times; to 1.33&times;, mean 1.25&times;</strong> &mdash; a roughly constant factor rather than a structural failure. It supersedes both earlier estimates from this work, one of 2&ndash;3&times; and one of 30&ndash;40%, each withdrawn for reasons given in &sect;8.</p>
+
+  <figure>
+    <svg viewBox="0 0 620 335" role="img" aria-label="Measured throughput against speculation depth for three methods, with the cost model predictions as faint dashed lines above them.">
+      <line x1="60" y1="255.0" x2="494" y2="255.0" stroke="var(--grid)" stroke-width="1"/>
+      <text class="sv-n" x="50" y="258.4" text-anchor="end">1.0x</text>
+      <line x1="60" y1="192.5" x2="494" y2="192.5" stroke="var(--grid)" stroke-width="1"/>
+      <text class="sv-n" x="50" y="195.9" text-anchor="end">1.5x</text>
+      <line x1="60" y1="130.0" x2="494" y2="130.0" stroke="var(--grid)" stroke-width="1"/>
+      <text class="sv-n" x="50" y="133.4" text-anchor="end">2.0x</text>
+      <line x1="60" y1="67.5" x2="494" y2="67.5" stroke="var(--grid)" stroke-width="1"/>
+      <text class="sv-n" x="50" y="70.9" text-anchor="end">2.5x</text>
+      <line x1="60" y1="255.0" x2="494" y2="255.0" stroke="var(--negative)" stroke-width="1.5" stroke-dasharray="4 3"/>
+      <text class="sv-n" x="68" y="249.0" fill="var(--negative)">no speedup below this line</text>
+      <text class="sv-n" x="60.0" y="303" text-anchor="middle">1</text>
+      <text class="sv-n" x="122.0" y="303" text-anchor="middle">2</text>
+      <text class="sv-n" x="184.0" y="303" text-anchor="middle">3</text>
+      <text class="sv-n" x="246.0" y="303" text-anchor="middle">4</text>
+      <text class="sv-n" x="308.0" y="303" text-anchor="middle">5</text>
+      <text class="sv-n" x="370.0" y="303" text-anchor="middle">6</text>
+      <text class="sv-n" x="432.0" y="303" text-anchor="middle">7</text>
+      <text class="sv-n" x="494.0" y="303" text-anchor="middle">8</text>
+      <text class="sv-t" x="290" y="322" text-anchor="middle">speculation depth k</text>
+      <text class="sv-t" x="16" y="155" text-anchor="middle" transform="rotate(-90 16 155)">throughput vs autoregressive</text>
+      <path d="M60.0 171.5 L122.0 116.3 L184.0 82.9 L246.0 59.8 L308.0 47.3 L370.0 43.8 L432.0 43.8 L494.0 47.0" fill="none" stroke="var(--s-spire)" stroke-width="1.5" opacity="0.45" stroke-dasharray="5 4" stroke-linejoin="round"/>
+      <path d="M60.0 198.2 L122.0 154.4 L184.0 129.5 L246.0 120.3 L308.0 109.8 L370.0 112.4 L432.0 111.0 L494.0 118.0" fill="none" stroke="var(--s-spire)" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round"/>
+      <circle cx="60.0" cy="198.2" r="3.3" fill="var(--s-spire)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="122.0" cy="154.4" r="3.3" fill="var(--s-spire)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="184.0" cy="129.5" r="3.3" fill="var(--s-spire)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="246.0" cy="120.3" r="3.3" fill="var(--s-spire)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="308.0" cy="109.8" r="3.3" fill="var(--s-spire)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="370.0" cy="112.4" r="3.3" fill="var(--s-spire)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="432.0" cy="111.0" r="3.3" fill="var(--s-spire)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="494.0" cy="118.0" r="3.3" fill="var(--s-spire)" stroke="var(--ground)" stroke-width="1.5"/>
+      <text class="sv-l" x="504" y="122.0" fill="var(--s-spire)">SPIRe</text>
+      <path d="M60.0 190.8 L122.0 159.0 L184.0 144.0 L246.0 136.9 L308.0 138.5 L370.0 140.5 L432.0 147.0 L494.0 150.8" fill="none" stroke="var(--s-magicdec)" stroke-width="1.5" opacity="0.45" stroke-dasharray="5 4" stroke-linejoin="round"/>
+      <path d="M60.0 236.9 L122.0 208.0 L184.0 192.6 L246.0 185.1 L308.0 183.0 L370.0 182.8 L432.0 181.8 L494.0 184.0" fill="none" stroke="var(--s-magicdec)" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round"/>
+      <circle cx="60.0" cy="236.9" r="3.3" fill="var(--s-magicdec)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="122.0" cy="208.0" r="3.3" fill="var(--s-magicdec)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="184.0" cy="192.6" r="3.3" fill="var(--s-magicdec)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="246.0" cy="185.1" r="3.3" fill="var(--s-magicdec)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="308.0" cy="183.0" r="3.3" fill="var(--s-magicdec)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="370.0" cy="182.8" r="3.3" fill="var(--s-magicdec)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="432.0" cy="181.8" r="3.3" fill="var(--s-magicdec)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="494.0" cy="184.0" r="3.3" fill="var(--s-magicdec)" stroke="var(--ground)" stroke-width="1.5"/>
+      <text class="sv-l" x="504" y="188.0" fill="var(--s-magicdec)">MagicDec</text>
+      <path d="M60.0 212.2 L122.0 202.4 L184.0 205.6 L246.0 214.0 L308.0 224.8 L370.0 235.2 L432.0 245.2 L494.0 252.4" fill="none" stroke="var(--s-vanilla)" stroke-width="1.5" opacity="0.45" stroke-dasharray="5 4" stroke-linejoin="round"/>
+      <path d="M60.0 254.4 L122.0 243.6 L184.0 246.6 L246.0 252.4 L308.0 259.0 L370.0 265.6 L432.0 272.8 L494.0 278.1" fill="none" stroke="var(--s-vanilla)" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round"/>
+      <circle cx="60.0" cy="254.4" r="3.3" fill="var(--s-vanilla)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="122.0" cy="243.6" r="3.3" fill="var(--s-vanilla)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="184.0" cy="246.6" r="3.3" fill="var(--s-vanilla)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="246.0" cy="252.4" r="3.3" fill="var(--s-vanilla)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="308.0" cy="259.0" r="3.3" fill="var(--s-vanilla)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="370.0" cy="265.6" r="3.3" fill="var(--s-vanilla)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="432.0" cy="272.8" r="3.3" fill="var(--s-vanilla)" stroke="var(--ground)" stroke-width="1.5"/>
+      <circle cx="494.0" cy="278.1" r="3.3" fill="var(--s-vanilla)" stroke="var(--ground)" stroke-width="1.5"/>
+      <text class="sv-l" x="504" y="282.1" fill="var(--s-vanilla)">Vanilla</text>
+    </svg>
+    <figcaption><span class="fignum">FIG 4</span><b>Measured throughput against the cost model&rsquo;s prediction.</b> Solid lines with points are measured; faint dashed lines are what the model predicts for the same method and depth. Every method sits about a quarter below its prediction at every depth, and the gaps between the methods survive. Vanilla crosses <b>below 1.0</b> from k=5 &mdash; speculative decoding is a net loss in this regime, where the model predicts a 1.36&times; gain.</figcaption>
+  </figure>
+
+  <div class="tw">
+  <table>
+    <caption>Throughput at the paper&rsquo;s operating point, <span class="m">k=4</span>. Measured pairs the measured ITM with the 600-context &tau; of &sect;4 rather than the 64-context sample the timing batch provides.</caption>
+    <thead><tr><th>Method</th><th>Measured</th><th>Paper Fig. 4</th><th>Measured / predicted</th></tr></thead>
+    <tbody>
+      <tr><td class="name">Vanilla</td><td class="neg">1.021&times;</td><td class="ref">1.36&times;</td><td class="pred">0.75</td></tr>
+      <tr><td class="name">MagicDec</td><td class="meas">1.559&times;</td><td class="ref">2.05&times;</td><td class="pred">0.76</td></tr>
+      <tr class="hl"><td class="name">SPIRe</td><td class="meas">2.078&times;</td><td class="ref">2.78&times;</td><td class="pred">0.75</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="claim">
+    Every absolute lands at <strong>0.75&ndash;0.76</strong> of prediction. But the paper&rsquo;s claims are <em>ratios between methods</em>, and a common factor cancels out of a ratio. It claims &ldquo;over 100% versus vanilla, over 35% versus MagicDec&rdquo;; measured on hardware at its own operating point, SPIRe delivers <strong>+104%</strong> over vanilla against a published +104%, and <strong>+33%</strong> over MagicDec against +36%. <strong>The cost model mispredicts every absolute throughput by a quarter and predicts the differences between methods almost exactly</strong> &mdash; which is what a roofline model omitting a constant overhead fraction should do, and it means the paper&rsquo;s comparative conclusions survive measurement even though its absolute numbers do not.
+  </div>
+
+  <h3>Two things only measurement shows</h3>
+  <p><strong>Vanilla speculative decoding is a net loss in this regime.</strong> 1.021&times; at k=4 is barely break-even, and it falls below 1.0 from k=5 to reach 0.815&times; at k=8. The model predicts 1.36&times;. At B=64 and L=512 the dense draft&rsquo;s KV reads cost more than its acceptance buys, and no analytical term in the model captures it.</p>
+  <p><strong>Only the dense draft has a depth that matters.</strong> Vanilla peaks sharply at k=2 (1.091&times;) and degrades hard past it &mdash; 25% lost by k=8, and below break-even from k=5. Both sparse methods are essentially flat from k=4 onward: SPIRe varies 3.9% across k=4&hellip;8 and MagicDec 1.7%, against ~1% timing jitter. The useful statement is the asymmetry: <strong>deep speculation is safe for a sparse draft and actively harmful for a dense one.</strong> A dense draft re-reads the whole context on every one of its k passes, so each extra token of depth costs it the full cache; a windowed draft pays a constant. That is the cost-side counterpart of the acceptance finding in &sect;4, and the one direction a single k=4 evaluation cannot show.</p>
+
+  <h3>Against the model&rsquo;s own predictions across depth</h3>
+  <p>The paper publishes nothing at <span class="m">k &ne; 4</span>, so this compares measurement against what its cost model predicts at each depth &mdash; curves it never plotted.</p>
+
+  <div class="tw">
+  <table>
+    <caption>Measured &divide; predicted throughput. A flat row would mean the model&rsquo;s error is a pure constant.</caption>
+    <thead><tr><th>Method</th><th>k=1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th><th>drift</th></tr></thead>
+    <tbody>
+      <tr><td class="name">Vanilla</td><td>0.75</td><td>0.77</td><td>0.77</td><td>0.77</td><td>0.78</td><td>0.79</td><td>0.80</td><td>0.80</td><td class="pred">+6%</td></tr>
+      <tr><td class="name">MagicDec</td><td>0.76</td><td>0.78</td><td>0.79</td><td>0.80</td><td>0.82</td><td>0.82</td><td>0.85</td><td>0.86</td><td class="pred">+13%</td></tr>
+      <tr><td class="name">SPIRe</td><td>0.87</td><td>0.86</td><td>0.84</td><td>0.81</td><td>0.81</td><td>0.80</td><td>0.80</td><td>0.79</td><td class="pred">&minus;10%</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="claim">
+    This <strong>qualifies the &ldquo;flat 25%&rdquo; above</strong>. The factor is genuinely uniform at k=4 &mdash; 23.9% to 25.2% across three very different methods, which is why the ratios reproduce &mdash; but across the full sweep it drifts from 0.75 to 0.87, and it drifts in <em>opposite directions</em> for SPIRe versus the other two. The model grows steadily more pessimistic about the two drafts that re-read a large cache, and less so about the one that does not. So the error is not a constant offset: it has structure in k, and the structure tracks cache traffic.
+  </div>
+
+  <p>Predicted optima, for the record: vanilla k=2 &mdash; which measurement confirms, and it is the only one of the three whose curve is steep enough (25.4% variation) to locate &mdash; against SPIRe k=6 (measured 5) and MagicDec k=4 (measured 7), both on curves too flat to separate.</p>
+
+  <p>One caveat, stated because the harness itself flags it: all three modes print <span class="m">DISAGREE</span> on the &tau; cross-check. It is sampling. The timing harness measures &tau; on one batch of 64 contexts while the reference averages 600; re-running the acceptance harness on <em>that same batch</em> gives 2.322 / 3.456 / 2.846 against the timing run&rsquo;s 2.414 / 3.546 / 2.960 &mdash; agreement to 2.6&ndash;4.0%, the residual being the fixed-round versus G=64 stopping rule. That batch is simply harder than the split average, uniformly across all three methods. It does not touch the ITM column, where &tau; cancels.</p>
+
+  <h3>The sparse cache is now real, and building it corrected the model</h3>
+  <p>Until recently the sparse drafts&rsquo; cache was an attention <em>mask</em> over a full-length allocation. Distributions and &tau; were exact &mdash; a masked entry contributes precisely zero &mdash; but the draft still read every position from memory, so the bandwidth saving that is SPIRe&rsquo;s entire cost argument was not realized, and timing it would have measured the implementation rather than the method. It is now a compact ring: <span class="m">sink + window + k</span> entries, verified to produce <strong>bitwise identical</strong> draft distributions to the masked version across every round and both RoPE conventions.</p>
+
+  <div class="claim">
+    That <span class="m">+ k</span> is not padding, and it is a correction to the paper. A ring of <span class="m">sink + window</span> &mdash; the size the cost model charges for &mdash; <strong>cannot run speculative decoding at all</strong>: the draft writes k tokens ahead speculatively, and when they are rejected the next query still needs entries those writes evicted. Measured both ways, the undersized ring diverges from the reference by 1.1e&minus;01 while the correct one agrees to zero. At the paper&rsquo;s window 64 and k=4 the cost model understates the draft&rsquo;s cache by <strong>6.2%</strong>.
+  </div>
+
+  <p>A second finding fell out of transcribing the model. The appendix adds SPIRe one extra FLOPs term &mdash; projecting a memory vector into a key and a value &mdash; and at the paper&rsquo;s own operating point that term <strong>changes nothing</strong>. The draft is memory-bound there by 8.4&times;, so the roofline maximum never sees it; deleting it entirely leaves every published throughput figure bit-identical. It only bites at batch 512 with contexts of a few tens of tokens, well outside the plotted region. It is worth noting for what it prices: that term is the cost of feedback memory, the component the paper&rsquo;s own ablation ranks fifth of six at <span class="m">+0.049 &tau;</span>. A component whose benefit is 1.5% and whose modelled cost is exactly zero.</p>
+</section>
+
+<section>
+  <span class="secno">7</span>
+  <h2>Context length: the mechanism itself<span class="chip confirmed">measured</span></h2>
+  <p>Everything above is measured at a single context length. But SPIRe&rsquo;s entire argument is about what happens as context <em>grows</em>: the target&rsquo;s KV cache grows with L while a windowed draft&rsquo;s does not, so a sparse draft should get cheaper relative to the target the longer the context gets. That is the mechanism the method is named for, and it had never been put on a clock.</p>
+
+  <p>It needs no retraining. ITM is a ratio of timings over fixed shapes &mdash; it does not ask whether the model is any <em>good</em> at the length being timed, only what the hardware does &mdash; so it is measurable at context lengths the 67M target was never trained for.</p>
+
+  <figure>
+    <svg viewBox="0 0 620 330" role="img" aria-label="Relative cost of a speculative round against context length: flat for the dense draft, falling for both sparse drafts.">
+          <line x1="66" y1="262.0" x2="452" y2="262.0" stroke="var(--grid)" stroke-width="1"/>
+          <text class="sv-n" x="56" y="265.4" text-anchor="end">1.0</text>
+          <line x1="66" y1="199.7" x2="452" y2="199.7" stroke="var(--grid)" stroke-width="1"/>
+          <text class="sv-n" x="56" y="203.1" text-anchor="end">1.5</text>
+          <line x1="66" y1="137.4" x2="452" y2="137.4" stroke="var(--grid)" stroke-width="1"/>
+          <text class="sv-n" x="56" y="140.8" text-anchor="end">2.0</text>
+          <line x1="66" y1="75.1" x2="452" y2="75.1" stroke="var(--grid)" stroke-width="1"/>
+          <text class="sv-n" x="56" y="78.5" text-anchor="end">2.5</text>
+          <line x1="66" y1="262.0" x2="452" y2="262.0" stroke="var(--rule-strong)" stroke-width="1"/>
+          <text class="sv-n" x="66.0" y="281" text-anchor="middle">512</text>
+          <text class="sv-n" x="150.4" y="281" text-anchor="middle">960</text>
+          <text class="sv-n" x="210.8" y="281" text-anchor="middle">1280</text>
+          <text class="sv-n" x="331.4" y="281" text-anchor="middle">1920</text>
+          <text class="sv-n" x="452.0" y="281" text-anchor="middle">2560</text>
+          <text class="sv-t" x="259" y="302" text-anchor="middle">context length L (tokens)</text>
+          <text class="sv-t" x="17" y="153" text-anchor="middle" transform="rotate(-90 17 153)">ITM &mdash; cost of a round / cost of one step</text>
+          <path d="M66.0 144.4 L150.4 141.3 L210.8 140.4 L331.4 139.4 L452.0 138.9" fill="none" stroke="var(--s-vanilla)" stroke-width="1.5" stroke-dasharray="5 4" opacity="0.45" stroke-linejoin="round"/>
+          <path d="M66.0 74.5 L150.4 60.1 L210.8 66.8 L331.4 62.7 L452.0 66.0" fill="none" stroke="var(--s-vanilla)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+          <circle cx="66.0" cy="74.5" r="3.4" fill="var(--s-vanilla)" stroke="var(--ground)" stroke-width="1.5"/>
+          <circle cx="150.4" cy="60.1" r="3.4" fill="var(--s-vanilla)" stroke="var(--ground)" stroke-width="1.5"/>
+          <circle cx="210.8" cy="66.8" r="3.4" fill="var(--s-vanilla)" stroke="var(--ground)" stroke-width="1.5"/>
+          <circle cx="331.4" cy="62.7" r="3.4" fill="var(--s-vanilla)" stroke="var(--ground)" stroke-width="1.5"/>
+          <circle cx="452.0" cy="66.0" r="3.4" fill="var(--s-vanilla)" stroke="var(--ground)" stroke-width="1.5"/>
+          <text class="sv-l" x="463.0" y="70.0" fill="var(--s-vanilla)" text-anchor="start">Vanilla</text>
+          <path d="M66.0 150.4 L150.4 199.2 L210.8 214.2 L331.4 229.6" fill="none" stroke="var(--s-magicdec)" stroke-width="1.5" stroke-dasharray="5 4" opacity="0.45" stroke-linejoin="round"/>
+          <path d="M66.0 89.5 L150.4 126.5 L210.8 147.8 L331.4 154.9" fill="none" stroke="var(--s-magicdec)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+          <circle cx="66.0" cy="89.5" r="3.4" fill="var(--s-magicdec)" stroke="var(--ground)" stroke-width="1.5"/>
+          <circle cx="150.4" cy="126.5" r="3.4" fill="var(--s-magicdec)" stroke="var(--ground)" stroke-width="1.5"/>
+          <circle cx="210.8" cy="147.8" r="3.4" fill="var(--s-magicdec)" stroke="var(--ground)" stroke-width="1.5"/>
+          <circle cx="331.4" cy="154.9" r="3.4" fill="var(--s-magicdec)" stroke="var(--ground)" stroke-width="1.5"/>
+          <text class="sv-l" x="327.4" y="171.9" fill="var(--s-magicdec)" text-anchor="start">MagicDec</text>
+          <text class="sv-n" x="327.4" y="184.9" fill="var(--s-magicdec)" opacity="0.8">2560 cell OOMs</text>
+          <path d="M66.0 234.1 L150.4 246.3 L210.8 250.0 L331.4 253.9 L452.0 255.9" fill="none" stroke="var(--s-spire)" stroke-width="1.5" stroke-dasharray="5 4" opacity="0.45" stroke-linejoin="round"/>
+          <path d="M66.0 196.2 L150.4 208.8 L210.8 216.4 L331.4 223.6 L452.0 230.7" fill="none" stroke="var(--s-spire)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+          <circle cx="66.0" cy="196.2" r="3.4" fill="var(--s-spire)" stroke="var(--ground)" stroke-width="1.5"/>
+          <circle cx="150.4" cy="208.8" r="3.4" fill="var(--s-spire)" stroke="var(--ground)" stroke-width="1.5"/>
+          <circle cx="210.8" cy="216.4" r="3.4" fill="var(--s-spire)" stroke="var(--ground)" stroke-width="1.5"/>
+          <circle cx="331.4" cy="223.6" r="3.4" fill="var(--s-spire)" stroke="var(--ground)" stroke-width="1.5"/>
+          <circle cx="452.0" cy="230.7" r="3.4" fill="var(--s-spire)" stroke="var(--ground)" stroke-width="1.5"/>
+          <text class="sv-l" x="463.0" y="234.7" fill="var(--s-spire)" text-anchor="start">SPIRe</text>
+          <text class="sv-b" x="66" y="26">SOLID = MEASURED &nbsp;&middot;&nbsp; DASHED = COST MODEL</text>
+        </svg>
+    <figcaption><span class="fignum">FIG 5</span><b>The mechanism reproduces.</b> k=4, B=64, <span class="m">klen</span> pinned per L and shared across all three methods. The dense draft varies by <b>under 5%</b> across a 5&times; context range, with no trend in it &mdash; exactly what a control should do, since its draft re-reads a cache growing in lockstep with the target&rsquo;s. Both sparse drafts fall. The cost model (dashed) gets the <em>shape</em> right in all three cases and the level wrong in all three, by the same roughly constant factor found in &sect;6.</figcaption>
+  </figure>
+
+  <div class="tw">
+  <table>
+    <caption>Measured ITM against context length, with the cost model&rsquo;s prediction beneath each. Lower is better: ITM is what one speculative round costs in units of one plain decode step.</caption>
+    <thead><tr><th>Method</th><th>512</th><th>960</th><th>1280</th><th>1920</th><th>2560</th><th>change</th></tr></thead>
+    <tbody>
+      <tr><td class="name">Vanilla, measured</td><td class="meas">2.505</td><td class="meas">2.621</td><td class="meas">2.567</td><td class="meas">2.600</td><td class="meas">2.573</td><td class="dim">+2.7%</td></tr>
+      <tr><td class="name"><span class="dim">&nbsp;&nbsp;predicted</span></td><td class="pred">1.944</td><td class="pred">1.969</td><td class="pred">1.976</td><td class="pred">1.984</td><td class="pred">1.988</td><td class="dim">+2.3%</td></tr>
+      <tr><td class="name">MagicDec, measured</td><td class="meas">2.385</td><td class="meas">2.088</td><td class="meas">1.917</td><td class="meas">1.860</td><td class="dim">&mdash;</td><td class="meas">&minus;22%</td></tr>
+      <tr><td class="name"><span class="dim">&nbsp;&nbsp;predicted</span></td><td class="pred">1.896</td><td class="pred">1.504</td><td class="pred">1.384</td><td class="pred">1.260</td><td class="dim">&mdash;</td><td class="dim">&minus;34%</td></tr>
+      <tr class="hl"><td class="name">SPIRe, measured</td><td class="meas">1.528</td><td class="meas">1.427</td><td class="meas">1.366</td><td class="meas">1.308</td><td class="meas">1.251</td><td class="meas">&minus;18%</td></tr>
+      <tr><td class="name"><span class="dim">&nbsp;&nbsp;predicted</span></td><td class="pred">1.224</td><td class="pred">1.126</td><td class="pred">1.096</td><td class="pred">1.065</td><td class="pred">1.049</td><td class="dim">&minus;14%</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>What it is worth in throughput</h3>
+  <p>Holding &tau; at its L=512 value &mdash; which the paper&rsquo;s own Table 1 licenses and &sect;2 confirmed flat in L to 1.1% &mdash; gives end-to-end speedup directly:</p>
+
+  <div class="tw">
+  <table>
+    <caption>Throughput <span class="m">&tau;/ITM</span> against a non-speculative baseline, and SPIRe&rsquo;s margin over each competitor.</caption>
+    <thead><tr><th></th><th>512</th><th>960</th><th>1280</th><th>1920</th><th>2560</th></tr></thead>
+    <tbody>
+      <tr class="hl"><td class="name">SPIRe</td><td class="meas">2.05&times;</td><td class="meas">2.20&times;</td><td class="meas">2.30&times;</td><td class="meas">2.40&times;</td><td class="meas">2.51&times;</td></tr>
+      <tr><td class="name">MagicDec</td><td>1.55&times;</td><td>1.77&times;</td><td>1.92&times;</td><td>1.98&times;</td><td class="dim">&mdash;</td></tr>
+      <tr><td class="name">Vanilla</td><td class="neg">1.03&times;</td><td class="neg">0.99&times;</td><td class="neg">1.01&times;</td><td class="neg">0.99&times;</td><td class="neg">1.00&times;</td></tr>
+      <tr><td class="name"><span class="dim">SPIRe over vanilla</span></td><td>1.99&times;</td><td>2.23&times;</td><td>2.28&times;</td><td>2.42&times;</td><td class="meas">2.50&times;</td></tr>
+      <tr><td class="name"><span class="dim">SPIRe over MagicDec</span></td><td>1.33&times;</td><td>1.24&times;</td><td>1.19&times;</td><td>1.21&times;</td><td class="dim">&mdash;</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="claim">
+    <strong>The paper&rsquo;s +104% is a floor.</strong> It is quoted at L=512, the shortest context in its own grid, and the margin over vanilla grows to <strong>2.50&times; by L=2560</strong> &mdash; half again as much over a 5&times; context increase. The paper understates its own method by measuring it where the mechanism has barely started working. Vanilla, meanwhile, sits at break-even the whole way: at B=64 a dense draft buys nothing at any context length tested.
+  </div>
+
+  <p>The counter-trend is equally real, and the paper cannot see it because it stops at 960: <strong>SPIRe&rsquo;s lead over MagicDec shrinks</strong>, 1.33&times; to 1.21&times;. The reason is the same one that makes MagicDec&rsquo;s &tau; the only one that drifts in &sect;2 &mdash; its draft <em>is</em> the full target, so it has far more cache to save by going sparse, and the savings arrive later. Whether the two curves cross is the open question, and the single cell that would answer it is the one that would not fit.</p>
+
+  <h3>A control that came free</h3>
+  <p>This sweep used <strong>synthetic prompts</strong>: the corpus would have taken ~26 hours to transfer at the link speed available, and ITM cannot depend on prompt content. That assumption was then checked rather than asserted &mdash; at L=512 it reproduces the corpus-prompt run of &sect;6 to within 1%.</p>
+
+  <div class="tw">
+  <table>
+    <caption>Same three methods at L=512, k=4, differing only in what the prompt tokens are.</caption>
+    <thead><tr><th>Method</th><th>ITM, corpus</th><th>ITM, synthetic</th><th>&Delta;</th><th>&tau;, corpus</th><th>&tau;, synthetic</th></tr></thead>
+    <tbody>
+      <tr><td class="name">Vanilla</td><td class="ref">2.529</td><td class="meas">2.505</td><td class="dim">&minus;0.9%</td><td class="ref">2.581</td><td class="neg">1.776</td></tr>
+      <tr><td class="name">MagicDec</td><td class="ref">2.365</td><td class="meas">2.385</td><td class="dim">+0.8%</td><td class="ref">3.688</td><td class="neg">&mdash;</td></tr>
+      <tr><td class="name">SPIRe</td><td class="ref">1.509</td><td class="meas">1.528</td><td class="dim">+1.3%</td><td class="ref">3.136</td><td class="neg">&mdash;</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>The &tau; column confirms the other half of the claim &mdash; acceptance is worthless on synthetic prompts, reading 1.776 against a true 2.581. Note the <em>direction</em>. An earlier synthetic-prompt failure in this work used constant <span class="m">jnp.ones</span> prompts and read &tau; too <em>high</em>, 2.000 against 1.688. Uniform random tokens are maximally unpredictable; a constant prompt is trivially predictable. Both wrong, opposite directions, one cause: neither is text. The harness prints a banner voiding &tau; and speedup whenever synthetic prompts are used, and only ITM is read from this sweep.</p>
+
+  <h3>The ceiling, and three wrong diagnoses</h3>
+  <p>The ladder stops at 2560, and MagicDec at 1920. Reaching even that took three attempts, and the first two diagnoses were both wrong:</p>
+  <ul>
+    <li><strong>Blamed attention.</strong> The byte count said otherwise: <span class="m">64 &times; 2561 &times; 50304 &times; 4</span> matches the reported 32,980,107,264 <em>exactly</em>. It was the <strong>unembedding</strong> &mdash; both prefill paths projected every prompt position to vocabulary and then read a single column. 33 GB materialized to keep 12.9 MB.</li>
+    <li><strong>The fix never ran.</strong> The harness builds three generators &mdash; a calibration probe plus two timed runs &mdash; and the new flag reached only the timed pair. Byte-identical error messages should have said so at once.</li>
+    <li><strong>Same bug, third site.</strong> The real fix reuses a flag added when this exact mistake OOMed feedback-memory training at 117 GB. A projection to vocabulary inside anything that runs over a whole sequence costs 200 KB per position per row: nothing at L=1, 33 GB at L=2560.</li>
+  </ul>
+  <p>What still caps the ladder is the attention term in MagicDec&rsquo;s <em>dense</em> draft prefill, which uses an explicit mask rather than FlashAttention (&sect;9). Clearing it means FlashAttention or a smaller batch &mdash; and a smaller batch would confound B with L, which is the one thing this sweep exists to separate.</p>
+</section>
+
+<section>
+  <span class="secno">8</span>
+  <h2>Corrections<span class="chip corrected">corrected</span></h2>
+  <p>Eight results reported during this work were later found wrong and revised. They are listed because the pattern connecting them is itself the most transferable finding here.</p>
+
+  <div class="corr">
+    <p class="corr-h">Cost model is 2&ndash;3&times; optimistic <span class="arrow">&rarr;</span> roughly 1.3&times;</p>
+    <p>The first timing harness held the round count fixed across depths, so higher <span class="m">k</span> committed more tokens per round and walked the cache further. Worse and less visible, the speculative cache is sized from a worst case that scales with <span class="m">k</span>, so depth 8 was charged for roughly twice the buffer depth 1 was, even at matched token counts. Both are now controlled.</p>
+  </div>
+
+  <div class="corr">
+    <p class="corr-h">A fixed per-pass overhead explains the gap <span class="arrow">&rarr;</span> it does not</p>
+    <p>Solving for one constant per forward pass gave values from 0.81 to 6.34 ms that scaled with batch size, and one cell produced a negative work term. The hypothesis was rejected on its own evidence rather than retained as a plausible story.</p>
+  </div>
+
+  <div class="corr">
+    <p class="corr-h">Feedback memory is worth only 0.049 &tau; <span class="arrow">&rarr;</span> the bundle is worth 0.442</p>
+    <p>The paper's ablation table separates the feedback-memory <em>mechanism</em> from the target-activation <em>substitution</em> it carries. Reading the first number alone made the component look cheap to skip; it is 59% of SPIRe's advantage over vanilla.</p>
+  </div>
+
+  <div class="corr">
+    <p class="corr-h">Sparse drafts cannot be timed <span class="arrow">&rarr;</span> they can, once the cache is compact</p>
+    <p>The blocker was real but it was an implementation gap, not a limit. A compact ring of <span class="m">sink + window + k</span> now backs both sparse drafts, bitwise identical to the masked version. Building it turned up two things the mask had hidden: the cost model charges for a ring one speculation depth too small to run, and the rotary table was being sized by <em>cache</em> length rather than by position &mdash; correct by coincidence on a dense cache, and silently wrong on a compact one for exactly the long contexts the method exists to serve.</p>
+  </div>
+
+  <div class="corr">
+    <p class="corr-h">The timed cache was sized for every draft being accepted <span class="arrow">&rarr;</span> sized from measured &tau;</p>
+    <p>The harness pinned its KV allocation using <span class="m">k+1</span> tokens per round &mdash; the maximum &mdash; where measured &tau; runs 1.8 to 4.1. Attention reads the whole allocation, so the surplus was charged to every cell, and <em>not evenly</em>: a dense draft reads all of it while a windowed draft reads its window regardless. The slack fell entirely on vanilla, which is the control. Corrected, the pin drops 14%.</p>
+  </div>
+
+  <div class="corr">
+    <p class="corr-h">The timing harness was measuring the compiler <span class="arrow">&rarr;</span> jit hoisted out of the call</p>
+    <p>The speculative entry point read <span class="m">return jax.jit(fn)(&hellip;)</span> <em>inside</em> its call body, building a fresh wrapper on every invocation. JAX keys its compilation cache on that wrapper, so each call missed and recompiled the whole program. A speculative call cost 7&ndash;22 seconds against plain decode&rsquo;s 54 ms; that was compile time. After the fix a zero-round call costs 53&ndash;54 ms in all three modes against a 53.7 ms plain prefill, and per-round costs order as physics requires &mdash; SPIRe cheapest, vanilla dearest.</p>
+    <p><b>Three earlier fixes preceded this one and none was the cause</b>: differencing two separate compilations, per-row rotary on a dense cache, and stacking per-round distributions no one reads. All three were real defects. None could have produced a sane number while the harness was timing its compiler. Each was diagnosed by reasoning about a <em>differenced</em> quantity with several faults compounded into it; what worked was timing the parts &mdash; prefill alone, then t(R) at R = 0, 4, 12, 38 &mdash; which took twenty minutes and was available from the first bad result.</p>
+  </div>
+
+  <div class="corr">
+    <p class="corr-h">k=4 is optimal for none of the three <span class="arrow">&rarr;</span> only vanilla has a locatable optimum</p>
+    <p>Reported as &ldquo;SPIRe peaks at k=5, MagicDec at k=7.&rdquo; Those are the arithmetic maxima, but MagicDec&rsquo;s throughput curve varies <strong>1.7% across k=4&hellip;8</strong> against ~1% timing jitter, and SPIRe&rsquo;s 3.9%. Naming a peak on a curve that flat is reading a maximum off a straight line &mdash; the same error that produced the withdrawn &ldquo;&tau; is not constant in L&rdquo; claim in &sect;4b, committed again on a different axis. Vanilla&rsquo;s optimum <em>is</em> real: its curve varies 25.4%, and the cost model predicts its location correctly.</p>
+  </div>
+
+  <div class="corr">
+    <p class="corr-h">Every &tau; measured before the decode fix <span class="arrow">&rarr;</span> invalid</p>
+    <p>Training feeds inputs shifted right by one with position zero masked to a sentinel; the decode path fed raw prompts. The model therefore answered "what token did I just see" rather than "what comes next", and greedy generation repeated its own last token indefinitely &mdash; while eval loss read a healthy 2.534.</p>
+  </div>
+
+  <div class="claim">
+    Three separate times, an internal metric agreed with itself while the deployed behavior was broken: the decode off-by-one (eval loss healthy, generation degenerate), the memory leak (training loss <em>better</em> than a correct run), and the first feedback-memory draft (loss 0.75, &tau; 1.000). <strong>The original test suite could not have caught any of them.</strong> It compared cached against non-cached, draft against target, generation against its own reference &mdash; the implementation against itself, green under any consistent error.
+  </div>
+
+  <p>The suite added since checks against things known independently, and every check is paired with a teeth test that fails if the check has become vacuous. A disabled feature must return the plain model <em>bitwise</em>. The memory projection must equal what a forward pass writes into the cache, <em>bitwise</em>. At a block size of one the mixing weights must be provably inert. The compact cache must match the masked one across every round. And the decode path must match a no-cache pass built from <em>training</em> semantics &mdash; which is what caught the rotary-table bug, since neither &tau; nor any loss curve can see it.</p>
+
+  <p>One detail of that last test is worth repeating. Comparing sampled <em>tokens</em> passed a cache that was genuinely broken: an untrained draft&rsquo;s logits are near-uniform, so its argmax is decided by float noise. Comparing the <em>distributions</em> separates &ldquo;different summation order&rdquo; at 1e&minus;07 from &ldquo;different attention inputs&rdquo; at 1e&minus;01. The observable was the difference between a green suite and a real one.</p>
+</section>
+
+<section>
+  <span class="secno">9</span>
+  <h2>What these numbers can and cannot be compared against</h2>
+
+  <h3>Measurement floor</h3>
+  <p>Greedy self-drafting, where the draft <em>is</em> the target, must give <span class="m">&tau; = k+1</span> exactly. It measures <span class="m">4.975&ndash;4.986</span>. The draft evaluates one token at a time while verification evaluates <span class="m">k+1</span> in a batch; in bfloat16 those reduce in different orders and near-tied argmaxes disagree. The shortfall is a systematic downward bias on every &tau; reported here, it is the ceiling no draft can exceed, and the analytical model cannot see it. It is also <em>not reproducible</em> run to run &mdash; the framework disables deterministic GPU reductions &mdash; so differences below about 0.03 between runs mean nothing.</p>
+
+  <h3>Statistical power</h3>
+  <p>The paper measures &tau; over <strong>n = 65,536 contexts</strong>, reporting 95% intervals of &plusmn;0.004. Every figure in &sect;2 comes from ~1,200 contexts under the paper&rsquo;s own token budget, giving intervals near <strong>&plusmn;0.020</strong> &mdash; five times wider than published, and tight enough to resolve the ~0.05 differences the comparison turns on. Earlier figures in this work came from 128 contexts &times; 8 rounds at &plusmn;0.10, wide enough to swallow several comparisons made at the time; those have all been retaken. A conservative per-context interval is also reported alongside each figure, since rounds inside one context share a prefix and are not independent draws.</p>
+
+  <h3>Known deviations</h3>
+  <ul>
+    <li>The mirror holds roughly 10% of the source corpus, and its non-contiguous chunks are reindexed densely on download.</li>
+    <li>Sequence length per document is 4096 rather than 1024, because the mirror's document count cannot otherwise reach the token budget. Same token count, drawn from about four times fewer distinct documents.</li>
+    <li>The paper contradicts itself on whether the draft&rsquo;s cache grows with context: &sect;3.1 says the mask keeps it &ldquo;constant with respect to the decoding sequence length&rdquo;, while the appendix cost model uses <span class="m">sink + L/8</span>, which is not. They agree only at L=512. This work follows the prose for training and acceptance, and the code for cost.</li>
+    <li>Acceptance is measured at the paper&rsquo;s exact grid, {256, 512, 960}, on a 7,680-token dataset build divisible by all three. An earlier grid of {256, 512, 1024} with a window scaled as L/8 was wrong on both counts and is withdrawn.</li>
+    <li>Hardware is H100 PCIe, giving an operational intensity of 756 rather than the SXM value of 600. The constant cancels exactly wherever all three roofline terms are memory-bound, which covers every grid cell at L&nbsp;&ge;&nbsp;128.</li>
+    <li>Batch size, learning rate and sampling temperature are unspecified by the paper and chosen here; the learning rate was selected from a probe that found the range flat to within 2%.</li>
+  </ul>
+
+  <h3>Open</h3>
+  <ul>
+    <li><strong>Absolute throughput on an optimized stack.</strong> The 25% the model is optimistic by is measured on <em>this</em> implementation &mdash; unfused kernels, a 67M model, no paged attention. A production stack sits closer to roofline, so the defensible claim is &ldquo;the model omits costs that are real at these scales,&rdquo; not a number that transfers. What does transfer is that the omission is close to a constant factor, so the ratios hold.</li>
+    <li><strong>Attribution inside the memory pathway.</strong> The 69% capture in &sect;5 cannot be split between target-activation substitution and feedback memory without the intermediate arm the paper publishes at 3.352. That is one 3-hour run and it is the outstanding diagnostic.</li>
+    <li><strong>Long context.</strong> Everything here is at L&nbsp;&le;&nbsp;960, bounded by the target&rsquo;s 1024-token training length. A genuine long-context evaluation needs a target trained at 4096 or beyond &mdash; which is where the paper&rsquo;s extrapolation to 128K contexts actually lives.</li>
+  </ul>
+</section>
+
+<footer>
+  Reproduction of Neelam et al., <em>SPIRe: Boosting LLM Inference Throughput with Speculative Decoding</em>, arXiv:2504.06419.<br>
+  Code: fork of MatX-inc/seqax, branch <span class="m">spire_reproducer</span>. Full results and the fidelity ledger live in <span class="m">docs/results.md</span> and <span class="m">docs/fidelity-ledger.md</span>.<br>
+  Approximately 60 GPU-hours on a single H100 PCIe.
+</footer>
+
+</div>
+
+</body></html>
