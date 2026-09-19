@@ -103,6 +103,7 @@ def make_speculative_generate(
     klen: Optional[int] = None,
     return_drafts: bool = False,
     compact_draft_cache: bool = False,
+    prefill_chunk: int = 0,
     _ring_slack: Optional[int] = None,
 ):
     """Build a jitted, sharded speculative generate function.
@@ -162,6 +163,15 @@ def make_speculative_generate(
     #
     # Both paths are kept. They must agree bitwise, and tests/test_ring_buffer.py
     # asserts exactly that; the full-cache path is the oracle.
+    # Prefill in chunks when asked. Attention here is explicit-mask, not
+    # FlashAttention, so a prefill over Pf tokens materialises [B, Pf, Klen]
+    # logits plus a mask broadcast and a `where` copy alongside it. At B=64 and
+    # L=2560 that asked XLA for 33 GB and OOMed, capping the context ladder at
+    # 1920. Chunking bounds it by the chunk instead of by Pf: each slice attends
+    # to the cache the previous ones built, which is exactly what the per-row
+    # kv_offset already supports. Prefill sits outside every timing measurement
+    # -- the zero-round baseline subtracts it -- so this changes reach, not
+    # results. 0 disables it.
     ring = compact_draft_cache and draft_window is not None and draft_window < Klen
     # The ring is window + k wide, NOT window. Ordinary autoregressive decoding
     # can hold exactly the window it reads, but a draft writes k tokens ahead
@@ -328,8 +338,22 @@ def make_speculative_generate(
         # 3.7. For a 512-token context that is ~508 positions with real memory
         # against the handful without.
         use_mem = h_draft.n_mem > 0
-        t_out = target_forward(w_t, ids0, zero_pos, emit_acts=use_mem)(t_cache)
-        t_logits, t_cache = t_out[0], t_out[1]
+        if prefill_chunk and Pf > prefill_chunk:
+            acc = []
+            for c0 in range(0, Pf, prefill_chunk):
+                t_out = target_forward(w_t, ids0[:, c0 : c0 + prefill_chunk],
+                                       zero_pos + c0, emit_acts=use_mem)(t_cache)
+                t_logits, t_cache = t_out[0], t_out[1]
+                if use_mem:
+                    acc.append(t_out[3])
+            # Only the LAST chunk's logits matter -- the first sampled token comes
+            # from the final prompt position -- but the activations are needed for
+            # every position, so they are stitched back together here.
+            if use_mem:
+                t_out = (t_logits, t_cache, t_out[2], jnp.concatenate(acc, axis=2))
+        else:
+            t_out = target_forward(w_t, ids0, zero_pos, emit_acts=use_mem)(t_cache)
+            t_logits, t_cache = t_out[0], t_out[1]
         prefill_mem = None
         if use_mem:
             # Draft layer j is target layer j+first, whose input is layer
@@ -378,8 +402,15 @@ def make_speculative_generate(
             # per-round read, and that reads C_d.
             tmp = jnp.zeros((h_draft.layers, 2, lb, Klen, h_draft.n_kv, h_draft.d_head), jnp.bfloat16)
             tmp_pos = jnp.broadcast_to(jnp.arange(Klen, dtype=jnp.int32)[None, :], (lb, Klen))
-            _, tmp, _ = draft_forward(w_d, ids0, zero_pos, d_prefill_window,
-                                      memory=prefill_mem, slot_pos=tmp_pos, dense_write=True)(tmp)
+            if prefill_chunk and Pf > prefill_chunk:
+                for c0 in range(0, Pf, prefill_chunk):
+                    mem_c = None if prefill_mem is None else prefill_mem[:, :, c0 : c0 + prefill_chunk]
+                    _, tmp, _ = draft_forward(
+                        w_d, ids0[:, c0 : c0 + prefill_chunk], zero_pos + c0, d_prefill_window,
+                        memory=mem_c, slot_pos=tmp_pos, dense_write=True)(tmp)
+            else:
+                _, tmp, _ = draft_forward(w_d, ids0, zero_pos, d_prefill_window,
+                                          memory=prefill_mem, slot_pos=tmp_pos, dense_write=True)(tmp)
             d_cache = tmp[:, :, :, jnp.asarray(_src_safe), :, :] if ring else tmp
 
         p0 = _dists(t_logits[:, -1], temperature)

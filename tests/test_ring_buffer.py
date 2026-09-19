@@ -53,11 +53,11 @@ print(f"geometry: Klen={KLEN}, compact C_d={SINK}+{WINDOW}+{K}={C_D} "
       f"{WINDOW + K}-slot ring {S / (WINDOW + K):.1f} times")
 
 
-def run(w_t, w_d, h_d, prompt, *, compact, slack=None, **kw):
+def run(w_t, w_d, h_d, prompt, *, compact, slack=None, chunk=0, **kw):
     gen = make_speculative_generate(
         h_t, h_d, P, R, K, 1.0, draft_sink=SINK, draft_window=WINDOW,
         klen=KLEN, return_drafts=True, compact_draft_cache=compact,
-        _ring_slack=slack, **kw)
+        _ring_slack=slack, prefill_chunk=chunk, **kw)
     with shardtypes.Scope():
         out, n_gen, n_acc, drafts, qs = gen(w_t, w_d, jnp.asarray(prompt),
                                             jnp.zeros((2,), jnp.uint32))
@@ -126,5 +126,22 @@ with Mesh(mesh_utils.create_device_mesh([1, 1, 1], jax.devices()[:1]), ("d", "t"
         f"detect eviction of a live position")
     print(f"{n + 2}. sink+window alone DIVERGES (max |dq| = {dq_bad:.1e}): "
           f"the +k slack is required   PASSED")
+
+    # Chunked prefill must change nothing. It exists only to bound the memory a
+    # prefill materialises, so that longer contexts fit; each chunk attends to the
+    # cache the previous ones built, which is the same computation in a different
+    # order. Prefill also sits outside every timing measurement, so a discrepancy
+    # here would be a silent correctness bug rather than a visible one.
+    for name, wd, hd, kw in cases:
+        base = run(w_t, wd, hd, prompt, compact=True, chunk=0, **kw)
+        for ch in (4, 5):        # 4 divides Pf=16 exactly; 5 leaves a ragged tail
+            ck = run(w_t, wd, hd, prompt, compact=True, chunk=ch, **kw)
+            dq = float(np.abs(base[4] - ck[4]).max())
+            assert dq < 1e-4, (
+                f"{name}: prefill chunked at {ch} diverges from unchunked, "
+                f"max |dq| = {dq:.3e}")
+            for lbl, a, b in (("n_generated", base[1], ck[1]), ("n_accepted", base[2], ck[2])):
+                assert np.array_equal(a, b), f"{name}/{lbl} at chunk {ch}"
+    print(f"{n + 3}. chunked prefill is a no-op (chunks of 4 and 5, ragged tail)   PASSED")
 
     print("\nall ring-buffer tests passed")

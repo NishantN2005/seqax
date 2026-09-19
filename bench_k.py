@@ -109,6 +109,12 @@ def main() -> None:
     p.add_argument("--max-jitter", type=float, default=0.10)
     p.add_argument("--hoi", type=float, default=HOI_H100_PCIE)
     p.add_argument("--out", default=None)
+    p.add_argument("--prefill-chunk", type=int, default=0,
+                   help="prefill in slices of this many tokens. Explicit-mask attention "
+                        "materialises [B, Pf, Klen] at once, which OOMs above L~1920 at B=64; "
+                        "chunking bounds it by the slice. Prefill is subtracted by the "
+                        "zero-round baseline, so this changes reach, not results -- "
+                        "tests/test_ring_buffer.py asserts it is a no-op. 0 disables.")
     p.add_argument("--prompts", choices=["dataset", "random"], default="dataset",
                    help="'random' skips the corpus entirely. Legitimate ONLY for a pure ITM "
                         "measurement: ITM = t_round / t_plain is a timing ratio over fixed "
@@ -326,6 +332,7 @@ def main() -> None:
                 with shardtypes.Scope():
                     s0 = make_speculative_generate(
                         h_t, h_d, L, 0, k, args.temperature, klen=klen,
+                        prefill_chunk=args.prefill_chunk,
                         draft_sink=args.sink, draft_window=d_window,
                         draft_prefill_dense=prefill_dense, magicdec_rope=mdrope,
                         compact_draft_cache=True)
@@ -334,6 +341,7 @@ def main() -> None:
                 with shardtypes.Scope():
                     sN = make_speculative_generate(
                         h_t, h_d, L, R, k, args.temperature, klen=klen,
+                        prefill_chunk=args.prefill_chunk,
                         draft_sink=args.sink, draft_window=d_window,
                         draft_prefill_dense=prefill_dense, magicdec_rope=mdrope,
                         compact_draft_cache=True)
