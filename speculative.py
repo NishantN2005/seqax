@@ -163,15 +163,26 @@ def make_speculative_generate(
     #
     # Both paths are kept. They must agree bitwise, and tests/test_ring_buffer.py
     # asserts exactly that; the full-cache path is the oracle.
-    # Prefill in chunks when asked. Attention here is explicit-mask, not
-    # FlashAttention, so a prefill over Pf tokens materialises [B, Pf, Klen]
-    # logits plus a mask broadcast and a `where` copy alongside it. At B=64 and
-    # L=2560 that asked XLA for 33 GB and OOMed, capping the context ladder at
-    # 1920. Chunking bounds it by the chunk instead of by Pf: each slice attends
-    # to the cache the previous ones built, which is exactly what the per-row
-    # kv_offset already supports. Prefill sits outside every timing measurement
-    # -- the zero-round baseline subtracts it -- so this changes reach, not
-    # results. 0 disables it.
+    # Prefill in chunks when asked, which bounds two separate allocations that
+    # both scale with the prompt length.
+    #
+    # The one that actually OOMed is the UNEMBEDDING: forward_pass projects every
+    # position to vocabulary, so a prefill produces [B, Pf, V] f32 -- at B=64,
+    # L=2560, V=50304 that is exactly 32,980,107,264 bytes, which is the number
+    # XLA reported. Only the last position's logits are ever read (the first
+    # sampled token comes from the end of the prompt); the rest is computed and
+    # discarded. The second is attention: explicit-mask, not FlashAttention, so
+    # [B, Pf, Klen] logits plus a mask broadcast and a `where` copy.
+    #
+    # Chunking bounds both by the slice instead of by Pf: each slice attends to
+    # the cache the previous ones built, which is what the per-row kv_offset
+    # already supports. Prefill sits outside every timing measurement -- the
+    # zero-round baseline subtracts it -- so this changes reach, not results.
+    # 0 disables it.
+    #
+    # A tighter fix exists: forward_pass takes hidden_only, so a prefill could
+    # skip the projection entirely for all but the final position. Chunking was
+    # enough to clear the ceiling here.
     ring = compact_draft_cache and draft_window is not None and draft_window < Klen
     # The ring is window + k wide, NOT window. Ordinary autoregressive decoding
     # can hold exactly the window it reads, but a draft writes k tokens ahead

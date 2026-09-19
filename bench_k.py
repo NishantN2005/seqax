@@ -242,6 +242,7 @@ def main() -> None:
             with shardtypes.Scope():
                 sp = make_speculative_generate(
                     h_t, h_d, L, probe, k, args.temperature, klen=probe_klen,
+                    prefill_chunk=args.prefill_chunk,
                     draft_sink=args.sink, draft_window=d_window,
                     draft_prefill_dense=prefill_dense, magicdec_rope=mdrope,
                     compact_draft_cache=True)
